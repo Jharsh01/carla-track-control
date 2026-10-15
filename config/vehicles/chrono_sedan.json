@@ -1,0 +1,194 @@
+{
+  "state": [
+    {
+      "name": "X",
+      "unit": "m",
+      "description": "global position of the centre of gravity, x"
+    },
+    {
+      "name": "Y",
+      "unit": "m",
+      "description": "global position of the centre of gravity, y"
+    },
+    {
+      "name": "psi",
+      "unit": "rad",
+      "description": "heading"
+    },
+    {
+      "name": "Ux",
+      "unit": "m/s",
+      "description": "body-frame longitudinal velocity at the centre of gravity"
+    },
+    {
+      "name": "Uy",
+      "unit": "m/s",
+      "description": "body-frame lateral velocity at the centre of gravity"
+    },
+    {
+      "name": "r",
+      "unit": "rad/s",
+      "description": "yaw rate"
+    },
+    {
+      "name": "delta",
+      "unit": "rad",
+      "description": "road-wheel steering angle"
+    }
+  ],
+  "input": [
+    {
+      "name": "delta_rate",
+      "unit": "rad/s",
+      "description": "road-wheel steering rate"
+    },
+    {
+      "name": "Fx",
+      "unit": "N",
+      "description": "total longitudinal tire force, positive drive, negative brake"
+    }
+  ],
+  "vehicle": {
+    "description": "Project Chrono sedan (chrono_models Sedan_Vehicle) on PAC2002 tires 245/40 R18; written by identify_chrono",
+    "sources": {
+      "chrono": "read from the Chrono model at rest",
+      "identified": "from a manoeuvre driven in Chrono (see plant/identify_chrono.cpp)",
+      "design": "chosen for this project",
+      "constant": "physical constant"
+    },
+    "parameters": {
+      "m": {
+        "value": 1683.967,
+        "unit": "kg",
+        "source": "chrono",
+        "description": "mass"
+      },
+      "Izz": {
+        "value": 1324.3959100977495,
+        "unit": "kg m^2",
+        "source": "chrono",
+        "description": "yaw inertia about the centre of mass"
+      },
+      "a": {
+        "value": 1.4208221611951501,
+        "unit": "m",
+        "source": "chrono",
+        "description": "centre of mass to front axle"
+      },
+      "b": {
+        "value": 1.3551778388048497,
+        "unit": "m",
+        "source": "chrono",
+        "description": "centre of mass to rear axle"
+      },
+      "h": {
+        "value": 0.41873028862066974,
+        "unit": "m",
+        "source": "chrono",
+        "description": "centre of mass height"
+      },
+      "C_alpha_f": {
+        "value": 105273.7447088549,
+        "unit": "N/rad",
+        "source": "identified",
+        "description": "front axle cornering stiffness; Fiala fit to steering ramps at 10, 14, 18, 22 m/s on ground 0.9 (scripts/fit_chrono_tires.py)"
+      },
+      "C_alpha_r": {
+        "value": 152432.22725423105,
+        "unit": "N/rad",
+        "source": "identified",
+        "description": "rear axle cornering stiffness; Fiala fit to steering ramps at 10, 14, 18, 22 m/s on ground 0.9 (scripts/fit_chrono_tires.py)"
+      },
+      "mu": {
+        "value": 1.0371749999999997,
+        "unit": "-",
+        "source": "identified",
+        "description": "peak friction of the rear tires on ground of coefficient 0.9 (the dry road); Fiala fit to steering ramps at 10, 14, 18, 22 m/s on ground 0.9 (scripts/fit_chrono_tires.py)"
+      },
+      "grip_f": {
+        "value": 1.109335454479717,
+        "unit": "-",
+        "source": "identified",
+        "description": "peak friction of the front tires relative to mu; Fiala fit to steering ramps at 10, 14, 18, 22 m/s on ground 0.9 (scripts/fit_chrono_tires.py)"
+      },
+      "grip_r": {
+        "value": 1.0,
+        "unit": "-",
+        "source": "design",
+        "description": "the rear tires define mu"
+      },
+      "drive_front": {
+        "value": 1.0,
+        "unit": "-",
+        "source": "chrono",
+        "description": "share of drive force on the front axle (front-wheel drive)"
+      },
+      "brake_front": {
+        "value": 0.5,
+        "unit": "-",
+        "source": "chrono",
+        "description": "share of brake force on the front axle (equal brake torques)"
+      },
+      "F_drive_max": {
+        "value": 6000.0,
+        "unit": "N",
+        "source": "design",
+        "description": "peak drive force; Chrono's engine is not used"
+      },
+      "F_brake_max": {
+        "value": 23255.813953488374,
+        "unit": "N",
+        "source": "chrono",
+        "description": "four brakes at 2000 N m over the tire radius"
+      },
+      "P_max": {
+        "value": 150000.0,
+        "unit": "W",
+        "source": "design",
+        "description": "drive power; Chrono's engine is not used"
+      },
+      "CdA": {
+        "value": 0.6,
+        "unit": "m^2",
+        "source": "design",
+        "description": "drag coefficient times frontal area, applied to the Chrono chassis"
+      },
+      "Crr": {
+        "value": 0.0007436727542673696,
+        "unit": "-",
+        "source": "identified",
+        "description": "rolling resistance coefficient, from coasting"
+      },
+      "rho": {
+        "value": 1.225,
+        "unit": "kg/m^3",
+        "source": "constant",
+        "description": "air density"
+      },
+      "delta_max": {
+        "value": 0.5973833712662022,
+        "unit": "rad",
+        "source": "chrono",
+        "description": "road-wheel angle at full steering input"
+      },
+      "delta_rate_max": {
+        "value": 0.6,
+        "unit": "rad/s",
+        "source": "design",
+        "description": "road-wheel steering rate limit"
+      },
+      "Ux_min": {
+        "value": 1.0,
+        "unit": "m/s",
+        "source": "design",
+        "description": "slip-angle denominator guard; the model is meant for Ux > 3"
+      },
+      "g": {
+        "value": 9.81,
+        "unit": "m/s^2",
+        "source": "constant",
+        "description": "gravity"
+      }
+    }
+  }
+}

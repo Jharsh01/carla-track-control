@@ -1,0 +1,149 @@
+{
+ "mass": 1845.0,
+ "drag_coefficient": 0.15000000596046448,
+ "center_of_mass": [
+  0.44999998807907104,
+  0.0,
+  -0.29999998211860657
+ ],
+ "max_rpm": 15000.0,
+ "moi": 1.0,
+ "final_ratio": 9.0,
+ "gear_switch_time": 0.0,
+ "use_gear_autobox": true,
+ "damping_rate_full_throttle": 0.15000000596046448,
+ "torque_curve": [
+  [
+   -9.310943603515625,
+   743.0
+  ],
+  [
+   9000.0,
+   743.0
+  ],
+  [
+   9500.0,
+   660.0
+  ],
+  [
+   10400.0,
+   605.0
+  ],
+  [
+   12500.0,
+   528.0
+  ],
+  [
+   15000.0,
+   502.0
+  ]
+ ],
+ "steering_curve": [
+  [
+   0.0,
+   1.0
+  ],
+  [
+   20.0,
+   0.8999999761581421
+  ],
+  [
+   60.0,
+   0.800000011920929
+  ],
+  [
+   120.0,
+   0.699999988079071
+  ]
+ ],
+ "forward_gears": [
+  [
+   1.0,
+   0.0,
+   0.0
+  ]
+ ],
+ "use_sweep_wheel_collision": false,
+ "bbox_extent": [
+  2.3958897590637207,
+  1.081725001335144,
+  0.7438300251960754
+ ],
+ "bbox_location": [
+  0.02921886183321476,
+  -6.189419536895002e-07,
+  0.7358604073524475
+ ],
+ "actor_location": [
+  -64.64484405517578,
+  24.471010208129883,
+  0.5461000204086304
+ ],
+ "actor_yaw": 0.15919795632362366,
+ "wheels": [
+  {
+   "tire_friction": 3.5,
+   "damping_rate": 0.25,
+   "max_steer_angle": 69.99999237060547,
+   "radius": 37.0,
+   "max_brake_torque": 700.0,
+   "max_handbrake_torque": 0.0,
+   "lat_stiff_max_load": 3.0,
+   "lat_stiff_value": 20.0,
+   "long_stiff_value": 3000.0,
+   "position": [
+    -6302.42919921875,
+    2364.20947265625,
+    84.90548706054688
+   ]
+  },
+  {
+   "tire_friction": 3.5,
+   "damping_rate": 0.25,
+   "max_steer_angle": 69.99999237060547,
+   "radius": 37.0,
+   "max_brake_torque": 700.0,
+   "max_handbrake_torque": 0.0,
+   "lat_stiff_max_load": 3.0,
+   "lat_stiff_value": 20.0,
+   "long_stiff_value": 3000.0,
+   "position": [
+    -6302.892578125,
+    2530.891845703125,
+    84.9054946899414
+   ]
+  },
+  {
+   "tire_friction": 3.5,
+   "damping_rate": 0.25,
+   "max_steer_angle": 0.0,
+   "radius": 37.0,
+   "max_brake_torque": 700.0,
+   "max_handbrake_torque": 1400.0,
+   "lat_stiff_max_load": 3.0,
+   "lat_stiff_value": 20.0,
+   "long_stiff_value": 3000.0,
+   "position": [
+    -6602.89306640625,
+    2363.374755859375,
+    84.90599822998047
+   ]
+  },
+  {
+   "tire_friction": 3.5,
+   "damping_rate": 0.25,
+   "max_steer_angle": 0.0,
+   "radius": 37.0,
+   "max_brake_torque": 700.0,
+   "max_handbrake_torque": 1400.0,
+   "lat_stiff_max_load": 3.0,
+   "lat_stiff_value": 20.0,
+   "long_stiff_value": 3000.0,
+   "position": [
+    -6603.35595703125,
+    2530.05712890625,
+    84.90556335449219
+   ]
+  }
+ ]
+}

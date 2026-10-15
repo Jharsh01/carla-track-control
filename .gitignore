@@ -1,0 +1,17 @@
+# environments and builds (setup.sh)
+.venv/
+build/
+build-*/
+external/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# outputs
+results/
+*.mp4
+
+# editors
+.vscode/
+.idea/
+.DS_Store

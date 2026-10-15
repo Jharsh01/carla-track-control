@@ -1,0 +1,20 @@
+{
+  "description": "One-lap circuit from the hand sketch: two lanes of asphalt with the centreline as the lane divider, a grass strip each side, driven clockwise, with slower traffic in the right lane. Lengths in m, speeds in km/h.",
+  "corners": [[0.0, 0.0], [300.0, 0.0], [300.0, -30.0], [360.0, -30.0], [360.0, -130.0], [300.0, -130.0], [300.0, -330.0], [0.0, -330.0]],
+  "radii": [40.0, 15.0, 15.0, 25.0, 25.0, 25.0, 30.0, 30.0],
+  "start": [100.0, 0.0],
+  "lane_width": 3.5,
+  "grass_width": 1.75,
+  "mu_road": 0.9,
+  "mu_grass": 0.3,
+  "speed_limit_kmh": 80.0,
+  "ego": {"lane": "right", "start_speed_kmh": 50.0},
+  "traffic": [
+    {"at": [160.0, 0.0], "lane": "right", "speed_kmh": 30.0, "note": "slow car 60 m past the start line: every controller catches it on the top straight"},
+    {"at": [180.0, 0.0], "lane": "right", "speed_kmh": 50.0},
+    {"at": [360.0, -80.0], "lane": "right", "speed_kmh": 50.0},
+    {"at": [300.0, -220.0], "lane": "right", "speed_kmh": 50.0},
+    {"at": [160.0, -330.0], "lane": "right", "speed_kmh": 50.0},
+    {"at": [0.0, -180.0], "lane": "right", "speed_kmh": 50.0}
+  ]
+}

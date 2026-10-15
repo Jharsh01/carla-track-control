@@ -1,0 +1,15 @@
+{
+  "description": "NMPC planning margins per vehicle dynamics (sim/racetrack/driver.hpp, struct Tuning). Read by build/simulate and by the CARLA bridge; command-line options override them. Pure pursuit has none here.",
+  "bicycle": {
+    "nmpc": {"mu_use": 1.0, "brake_use": 1.0, "drive_use": 1.0, "sideslip_max_deg": 7.0},
+    "note": "the plant is the model plus lags: no margins needed"
+  },
+  "chrono": {
+    "nmpc": {"mu_use": 1.0, "brake_use": 1.0, "drive_use": 0.25, "sideslip_max_deg": 7.0},
+    "note": "The model's friction circle says front drive force takes lateral grip from the front tires; Chrono's PAC02 tires lose much less. Planning with the full drive force, the NMPC uses the throttle to correct oversteer, which in Chrono does not work, and the car slides wide. Offline, drive_use 0.25 laps cleanly on 3 sensor seeds (70.2-70.6 s, sideslip <= 7.0 deg, asphalt margin >= 0.19 m); 0.5 laps with sideslip up to 8.1 deg; 1.0 collides on 2 of 3 seeds."
+  },
+  "carla": {
+    "nmpc": {"mu_use": 0.9, "brake_use": 1.0, "drive_use": 0.25, "sideslip_max_deg": 7.0},
+    "note": "NOT tuned: CARLA has not been run with this repository yet. Chosen to be cautious, as for Chrono; config/vehicles/model3.json is itself partly assumed (docs/vehicle_parameters.md)."
+  }
+}

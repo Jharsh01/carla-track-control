@@ -1,0 +1,28 @@
+# Build the library and the offline simulation (without Project Chrono) and run the fast tests:
+# the library's own, and the CARLA bridge's against the stand-in carla module. No CARLA server.
+name: ci
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: system packages
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends cmake libeigen3-dev fonts-dejavu-core
+      - name: uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Python 3.8 environment
+        run: |
+          ~/.local/bin/uv venv --python 3.8 .venv
+          ~/.local/bin/uv pip install --python .venv/bin/python -r requirements.txt
+      - name: build
+        run: |
+          cmake -S . -B build -DPython3_EXECUTABLE=$PWD/.venv/bin/python
+          cmake --build build -j"$(nproc)"
+      - name: library tests
+        run: ctest --test-dir build --output-on-failure
+      - name: bridge tests
+        run: .venv/bin/python -m pytest -q -m "not slow"
+      - name: offline lap
+        run: build/simulate --controller pure_pursuit --perfect

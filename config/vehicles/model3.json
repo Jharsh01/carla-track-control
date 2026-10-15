@@ -1,0 +1,183 @@
+{
+  "state": [
+    {
+      "name": "X",
+      "unit": "m",
+      "description": "global position of the centre of gravity, x"
+    },
+    {
+      "name": "Y",
+      "unit": "m",
+      "description": "global position of the centre of gravity, y"
+    },
+    {
+      "name": "psi",
+      "unit": "rad",
+      "description": "heading"
+    },
+    {
+      "name": "Ux",
+      "unit": "m/s",
+      "description": "body-frame longitudinal velocity at the centre of gravity"
+    },
+    {
+      "name": "Uy",
+      "unit": "m/s",
+      "description": "body-frame lateral velocity at the centre of gravity"
+    },
+    {
+      "name": "r",
+      "unit": "rad/s",
+      "description": "yaw rate"
+    },
+    {
+      "name": "delta",
+      "unit": "rad",
+      "description": "road-wheel steering angle"
+    }
+  ],
+  "input": [
+    {
+      "name": "delta_rate",
+      "unit": "rad/s",
+      "description": "road-wheel steering rate"
+    },
+    {
+      "name": "Fx",
+      "unit": "N",
+      "description": "total longitudinal tire force, positive drive, negative brake"
+    }
+  ],
+  "vehicle": {
+    "description": "CARLA 0.9.15 vehicle.tesla.model3; derivations in docs/vehicle_parameters.md",
+    "sources": {
+      "carla": "read from the blueprint's physics control",
+      "derived": "computed from carla values",
+      "assumed": "not exposed by CARLA; estimate to be confirmed by a test",
+      "design": "chosen for this project",
+      "constant": "physical constant"
+    },
+    "parameters": {
+      "m": {
+        "value": 1845.0,
+        "unit": "kg",
+        "source": "carla",
+        "description": "mass"
+      },
+      "Izz": {
+        "value": 3958.0,
+        "unit": "kg m^2",
+        "source": "assumed",
+        "description": "yaw inertia, taken as m*a*b"
+      },
+      "a": {
+        "value": 1.168,
+        "unit": "m",
+        "source": "derived",
+        "description": "centre of gravity to front axle"
+      },
+      "b": {
+        "value": 1.836,
+        "unit": "m",
+        "source": "derived",
+        "description": "centre of gravity to rear axle"
+      },
+      "h": {
+        "value": 0.45,
+        "unit": "m",
+        "source": "assumed",
+        "description": "centre of gravity height"
+      },
+      "C_alpha_f": {
+        "value": 106500.0,
+        "unit": "N/rad",
+        "source": "derived",
+        "description": "front axle cornering stiffness (both tires)"
+      },
+      "C_alpha_r": {
+        "value": 67800.0,
+        "unit": "N/rad",
+        "source": "derived",
+        "description": "rear axle cornering stiffness (both tires)"
+      },
+      "mu": {
+        "value": 0.9,
+        "unit": "-",
+        "source": "assumed",
+        "description": "tire-road friction coefficient; a scenario variable"
+      },
+      "drive_front": {
+        "value": 0.5,
+        "unit": "-",
+        "source": "assumed",
+        "description": "share of drive force on the front axle (four-wheel drive)"
+      },
+      "brake_front": {
+        "value": 0.5,
+        "unit": "-",
+        "source": "derived",
+        "description": "share of brake force on the front axle"
+      },
+      "F_drive_max": {
+        "value": 18073.0,
+        "unit": "N",
+        "source": "derived",
+        "description": "peak drive force at the wheels"
+      },
+      "F_brake_max": {
+        "value": 7568.0,
+        "unit": "N",
+        "source": "derived",
+        "description": "peak brake force at the wheels"
+      },
+      "P_max": {
+        "value": 700000.0,
+        "unit": "W",
+        "source": "derived",
+        "description": "engine power"
+      },
+      "CdA": {
+        "value": 0.483,
+        "unit": "m^2",
+        "source": "derived",
+        "description": "drag coefficient times frontal area"
+      },
+      "Crr": {
+        "value": 0.012,
+        "unit": "-",
+        "source": "assumed",
+        "description": "rolling resistance coefficient"
+      },
+      "rho": {
+        "value": 1.225,
+        "unit": "kg/m^3",
+        "source": "constant",
+        "description": "air density"
+      },
+      "delta_max": {
+        "value": 0.855,
+        "unit": "rad",
+        "source": "derived",
+        "description": "road-wheel steering angle limit above 120 km/h"
+      },
+      "delta_rate_max": {
+        "value": 0.6,
+        "unit": "rad/s",
+        "source": "design",
+        "description": "road-wheel steering rate limit"
+      },
+      "Ux_min": {
+        "value": 1.0,
+        "unit": "m/s",
+        "source": "design",
+        "description": "slip-angle denominator guard; the model is meant for Ux > 3"
+      },
+      "g": {
+        "value": 9.81,
+        "unit": "m/s^2",
+        "source": "constant",
+        "description": "gravity"
+      }
+    }
+  }
+}
