@@ -35,8 +35,12 @@ def connect(host, port, timeout=60.0):
     return client
 
 
-def build_world(client, circuit, dt):
-    """Load the track as an OpenDRIVE world, synchronous with step `dt`. Returns (world, original settings)."""
+def build_world(client, circuit, dt, scenery=True):
+    """Load the track as an OpenDRIVE world, synchronous with step `dt`. Returns (world, original settings).
+
+    With `scenery`, the generated road and walls are invisible (they still collide) and scenery.py draws
+    the track: asphalt, kerbs, grass, barriers, trees. Without it, CARLA's own untextured mesh shows.
+    """
     xodr = opendrive.build(circuit)
     params = carla.OpendriveGenerationParameters(
         vertex_distance=1.0,  # mesh resolution along the road [m]; the 15 m corners need it finer than the default 2
@@ -44,7 +48,7 @@ def build_world(client, circuit, dt):
         wall_height=1.0,  # a barrier at the outer edge of the grass
         additional_width=0.6,
         smooth_junctions=True,
-        enable_mesh_visibility=True,
+        enable_mesh_visibility=not scenery,
         enable_pedestrian_navigation=False)
     world = client.generate_opendrive_world(xodr, params)
     original = world.get_settings()
@@ -57,6 +61,10 @@ def build_world(client, circuit, dt):
     world.apply_settings(settings)
     world.set_weather(carla.WeatherParameters.ClearNoon)
     world.tick()
+    if scenery:
+        from . import scenery as look
+
+        look.build(client, world, circuit)
     return world, original
 
 
