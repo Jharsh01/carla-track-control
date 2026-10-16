@@ -100,6 +100,8 @@ absorbs the engine map (`carla_bridge/actuation.py`).
 PAC2002 tires, driveline), stepped inside the bridge at 1 ms; CARLA only draws the car, with
 Chrono's roll and pitch. The controllers plan with `config/vehicles/chrono_sedan.json`, identified
 from the Chrono model. The grass's lower friction applies here only: CARLA's surface is uniform.
+How the plant works, why each step needs a solver and where its time goes:
+[`docs/chrono_plant.pdf`](docs/chrono_plant.pdf).
 
 **`--dynamics bicycle`**: the offline plant (the controllers' own dynamic bicycle model with the
 actuator lags, `config/vehicles/model3.json`), stepped inside the bridge like Chrono and drawn
