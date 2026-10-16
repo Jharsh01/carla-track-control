@@ -76,11 +76,12 @@ ssh -L 8080:localhost:8080 <instance>      # on your laptop
 | | |
 |---|---|
 | `--controller nmpc\|pure_pursuit\|both` | which controller(s) to run, one after the other (default both) |
-| `--dynamics carla\|chrono` | who simulates the ego car (default carla) |
+| `--dynamics carla\|chrono\|bicycle` | who simulates the ego car (default carla) |
 | `--perfect` | exact sensing, the whole road known |
 | `--road-range M`, `--seed N` | how far ahead the road is known; the noise seed |
 | `--laps N`, `--t-max S` | |
 | `--stream PORT`, `--no-video` | live view; no camera at all (fastest) |
+| `--no-rates` | no side panel plotting the controller's and the plant's rate in wall-clock Hz |
 | `--no-scenery` | CARLA's plain generated road instead of the drawn circuit |
 | `--docker` | start CARLA from the `carlasim/carla:0.9.15` image instead of `external/carla` |
 | `--offline` | no CARLA: the C++ simulation (`build/simulate -h`) |
@@ -100,7 +101,13 @@ PAC2002 tires, driveline), stepped inside the bridge at 1 ms; CARLA only draws t
 Chrono's roll and pitch. The controllers plan with `config/vehicles/chrono_sedan.json`, identified
 from the Chrono model. The grass's lower friction applies here only: CARLA's surface is uniform.
 
-The controllers see the same thing in both cases: the state at the centre of gravity in a
+**`--dynamics bicycle`**: the offline plant (the controllers' own dynamic bicycle model with the
+actuator lags, `config/vehicles/model3.json`), stepped inside the bridge like Chrono and drawn
+flat on the road. The car does what the NMPC predicts, so this shows the offline bicycle laps in
+the CARLA scenery rather than testing the controllers against a different car. The grass's
+friction applies here too.
+
+The controllers see the same thing in every case: the state at the centre of gravity in a
 right-handed frame (`carla_bridge/frames.py` converts from CARLA's left-handed one) and the other
 cars in track coordinates.
 

@@ -107,6 +107,41 @@ def test_pure_pursuit_laps_on_chrono_dynamics(tmp_path):
     assert status == 0 and r["completed"] and not r["collided"]
 
 
+@pytest.mark.slow
+def test_nmpc_laps_on_bicycle_dynamics(tmp_path):
+    status, r = lap("nmpc", "bicycle", tmp_path, "--no-video")
+    assert status == 0 and r["completed"] and not r["collided"]
+
+
+def video_size(path):
+    import imageio_ffmpeg
+
+    reader = imageio_ffmpeg.read_frames(str(path))
+    size = next(reader)["size"]
+    reader.close()
+    return size
+
+
+def test_rate_panel_widens_the_video(tmp_path):
+    from carla_bridge.view import RatePanel
+
+    lap("pure_pursuit", "carla", tmp_path, "--t-max", "0.5")
+    assert video_size(tmp_path / "pure_pursuit_carla.mp4") == (1280 + RatePanel.WIDTH, 720)
+    lap("pure_pursuit", "carla", tmp_path, "--t-max", "0.5", "--no-rates")
+    assert video_size(tmp_path / "pure_pursuit_carla.mp4") == (1280, 720)
+
+
+def test_rate_panel_averages():
+    from carla_bridge.view import RatePanel
+
+    panel = RatePanel(0.05)
+    for i in range(40):
+        panel.add(0.05 * (i + 1), 0.1, 0.02)  # the controller at 10 Hz, the plant at 50 Hz
+    assert panel.average("controller") == pytest.approx(10.0)
+    assert panel.average("plant") == pytest.approx(50.0)
+    assert panel.draw(np.zeros((720, 1280, 3), np.uint8)).shape == (720, 1280 + RatePanel.WIDTH, 3)
+
+
 def test_video_is_written(tmp_path):
     status, r = lap("pure_pursuit", "carla", tmp_path, "--t-max", "1.0")
     assert not r["completed"]  # stopped by the time limit

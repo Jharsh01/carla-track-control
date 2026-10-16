@@ -1,4 +1,4 @@
-"""Drive the race track in CARLA with the NMPC and/or pure pursuit, on CARLA's or Project Chrono's dynamics.
+"""Drive the race track in CARLA with the NMPC and/or pure pursuit, on CARLA's, Project Chrono's or the bicycle model's dynamics.
 
     python -m carla_bridge                                  both controllers, CARLA dynamics
     python -m carla_bridge --controller nmpc --dynamics chrono
@@ -27,7 +27,7 @@ import numpy as np  # noqa: E402
 
 import trackctl  # noqa: E402
 
-VEHICLE_FILES = {"carla": "model3.json", "chrono": "chrono_sedan.json"}
+VEHICLE_FILES = {"carla": "model3.json", "chrono": "chrono_sedan.json", "bicycle": "model3.json"}
 # columns of <stem>_solves.csv, one row per NMPC solve (NMPC::SolveStats; build/simulate writes the same)
 SOLVE_COLUMNS = ["t", "s0", "ux0", "t_wall", "t_total", "t_proc", "t_hess", "t_jac", "t_grad", "t_f", "t_g",
                  "iterations", "success", "status", "warm", "n_obstacles", "obj", "slack_obstacle", "slack_edge",
@@ -38,8 +38,9 @@ def parse(argv=None):
     p = argparse.ArgumentParser(prog="python -m carla_bridge", description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--controller", choices=["nmpc", "pure_pursuit", "both"], default="both")
-    p.add_argument("--dynamics", choices=["carla", "chrono"], default="carla",
-                   help="who simulates the ego car: CARLA's vehicle physics or the Project Chrono sedan")
+    p.add_argument("--dynamics", choices=["carla", "chrono", "bicycle"], default="carla",
+                   help="who simulates the ego car: CARLA's vehicle physics, the Project Chrono sedan or the "
+                        "controllers' own bicycle model (the offline plant)")
     p.add_argument("--host", default="localhost")
     p.add_argument("--port", type=int, default=2000)
     p.add_argument("--dt", type=float, default=0.05, help="world step = control period [s]")
@@ -53,6 +54,8 @@ def parse(argv=None):
     p.add_argument("--out", default=os.path.join(REPO, "results", "carla"))
     p.add_argument("--no-video", action="store_true", help="no camera: fastest; logs only")
     p.add_argument("--stream", type=int, metavar="PORT", help="serve the camera view live on this port")
+    p.add_argument("--no-rates", action="store_true",
+                   help="no side panel plotting the controller's and the plant's average rate in wall-clock Hz")
     p.add_argument("--no-plan", action="store_true", help="do not draw the NMPC's predicted path in the world")
     p.add_argument("--no-scenery", action="store_true",
                    help="CARLA's plain generated road instead of asphalt, kerbs, grass, barriers and trees")
@@ -161,15 +164,19 @@ def drive(args, client, circuit, controller, stream=None):
         dynamics = cw.DYNAMICS[dynamics_name](world, circuit, params, args.dt)
         actors.append(dynamics)
         traffic.place(0.0)
-        camera = video = hud = None
+        camera = video = hud = rates = None
+        width = 1280
         if not args.no_video or stream:
             camera = view.ChaseCamera(world, dynamics.actor)
             actors.append(camera)
             hud = view.Hud(circuit)
+            if not args.no_rates:
+                rates = view.RatePanel(args.dt)
+                width += view.RatePanel.WIDTH
         os.makedirs(args.out, exist_ok=True)
         stem = os.path.join(args.out, "%s_%s" % (controller, dynamics_name))
         if not args.no_video:
-            video = view.Video(stem + ".mp4", (1280, 720), fps=round(1.0 / args.dt))
+            video = view.Video(stem + ".mp4", (width, 720), fps=round(1.0 / args.dt))
 
         def friction(x):
             return circuit.friction(circuit.track_state(np.asarray(x))[1])
@@ -181,17 +188,25 @@ def drive(args, client, circuit, controller, stream=None):
         wall = time.time()
         print("driving %d lap(s) with %s on %s dynamics ..." % (args.laps, controller, dynamics_name))
         while t < args.t_max:
+            start = time.perf_counter()
             u = np.asarray(driver(t, x))
+            controller_time = time.perf_counter() - start
             e_y = run.update(t, x, u, args.dt, args.laps)
             if run.done:
                 break
+            start = time.perf_counter()
             dynamics.apply(u, x, friction)
+            plant_time = time.perf_counter() - start
             traffic.place(t + args.dt)
             if not args.no_plan and controller == "nmpc":
                 draw_plan(world, circuit, driver.plan, args.dt)
+            start = time.perf_counter()
             frame = world.tick()
             dynamics.after_tick()
+            plant_time += time.perf_counter() - start
             t += args.dt
+            if rates:
+                rates.add(t, controller_time, plant_time)
             x = np.asarray(dynamics.state())
             # the spectator (what a CARLA window would show) follows the car too
             ego = dynamics.actor.get_transform()
@@ -203,6 +218,8 @@ def drive(args, client, circuit, controller, stream=None):
                                        args.laps * circuit.track.length, driver.last_solve_time)
                 traffic_xy = [(p.x, p.y) for p in (circuit.traffic_pose(i, t) for i in range(circuit.n_traffic))]
                 rgb = hud.draw(rgb, lines, (x[0], x[1]), traffic_xy)
+                if rates:
+                    rgb = rates.draw(rgb)
                 if video:
                     video.add(rgb)
                 if stream:

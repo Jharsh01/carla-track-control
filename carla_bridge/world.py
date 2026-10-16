@@ -180,17 +180,20 @@ class ChronoDynamics:
     name = "chrono"
 
     def __init__(self, world, circuit, params, dt):
-        import trackctl
-
-        if not trackctl.have_chrono:
-            raise RuntimeError("trackctl was built without Project Chrono: run scripts/install_chrono.sh, then setup.sh")
         self.world, self.circuit, self.params, self.dt = world, circuit, params, dt
-        self.plant = trackctl.ChronoPlant(params)
+        self.plant = self._make_plant(params)
         x0 = circuit.initial_state()
         self.actor = spawn(world, EGO_BLUEPRINT, *self._origin(x0), physics=False, role="hero")
         world.tick()
         self.z = ground_offset(self.actor)
         self.reset(x0)
+
+    def _make_plant(self, params):
+        import trackctl
+
+        if not trackctl.have_chrono:
+            raise RuntimeError("trackctl was built without Project Chrono: run scripts/install_chrono.sh, then setup.sh")
+        return trackctl.ChronoPlant(params)
 
     def _origin(self, x):
         X0, Y0 = frames.origin_from_cg(x[0], x[1], x[2], self.circuit.body.cg_to_center)
@@ -232,4 +235,20 @@ class ChronoDynamics:
         self.actor.destroy()
 
 
-DYNAMICS = {"carla": CarlaDynamics, "chrono": ChronoDynamics}
+class BicycleDynamics(ChronoDynamics):
+    """The ego car on the controllers' own dynamic bicycle model (the offline plant), drawn in CARLA
+    flat on the road: the model has no roll, pitch or heave."""
+
+    name = "bicycle"
+
+    def _make_plant(self, params):
+        import trackctl
+
+        return trackctl.BicyclePlant(params)
+
+    def _pose(self):
+        X0, Y0, psi = self._origin(self.plant.observe())
+        self.actor.set_transform(transform(X0, Y0, psi, z=self.z))
+
+
+DYNAMICS = {"carla": CarlaDynamics, "chrono": ChronoDynamics, "bicycle": BicycleDynamics}
