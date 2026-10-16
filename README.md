@@ -107,7 +107,8 @@ How the plant works, why each step needs a solver and where its time goes:
 actuator lags, `config/vehicles/model3.json`), stepped inside the bridge like Chrono and drawn
 flat on the road. The car does what the NMPC predicts, so this shows the offline bicycle laps in
 the CARLA scenery rather than testing the controllers against a different car. The grass's
-friction applies here too.
+friction applies here too. The model's equations, tire curves, lags and limits:
+[`docs/bicycle_plant.pdf`](docs/bicycle_plant.pdf).
 
 The controllers see the same thing in every case: the state at the centre of gravity in a
 right-handed frame (`carla_bridge/frames.py` converts from CARLA's left-handed one) and the other
