@@ -35,8 +35,12 @@ def connect(host, port, timeout=60.0):
     return client
 
 
-def build_world(client, circuit, dt):
-    """Load the track as an OpenDRIVE world, synchronous with step `dt`. Returns (world, original settings)."""
+def build_world(client, circuit, dt, scenery=True):
+    """Load the track as an OpenDRIVE world, synchronous with step `dt`. Returns (world, original settings).
+
+    With `scenery`, the generated road and walls are invisible (they still collide) and scenery.py draws
+    the track: asphalt, kerbs, grass, barriers, trees. Without it, CARLA's own untextured mesh shows.
+    """
     xodr = opendrive.build(circuit)
     params = carla.OpendriveGenerationParameters(
         vertex_distance=1.0,  # mesh resolution along the road [m]; the 15 m corners need it finer than the default 2
@@ -44,7 +48,7 @@ def build_world(client, circuit, dt):
         wall_height=1.0,  # a barrier at the outer edge of the grass
         additional_width=0.6,
         smooth_junctions=True,
-        enable_mesh_visibility=True,
+        enable_mesh_visibility=not scenery,
         enable_pedestrian_navigation=False)
     world = client.generate_opendrive_world(xodr, params)
     original = world.get_settings()
@@ -57,6 +61,10 @@ def build_world(client, circuit, dt):
     world.apply_settings(settings)
     world.set_weather(carla.WeatherParameters.ClearNoon)
     world.tick()
+    if scenery:
+        from . import scenery as look
+
+        look.build(client, world, circuit)
     return world, original
 
 
@@ -172,17 +180,20 @@ class ChronoDynamics:
     name = "chrono"
 
     def __init__(self, world, circuit, params, dt):
-        import trackctl
-
-        if not trackctl.have_chrono:
-            raise RuntimeError("trackctl was built without Project Chrono: run scripts/install_chrono.sh, then setup.sh")
         self.world, self.circuit, self.params, self.dt = world, circuit, params, dt
-        self.plant = trackctl.ChronoPlant(params)
+        self.plant = self._make_plant(params)
         x0 = circuit.initial_state()
         self.actor = spawn(world, EGO_BLUEPRINT, *self._origin(x0), physics=False, role="hero")
         world.tick()
         self.z = ground_offset(self.actor)
         self.reset(x0)
+
+    def _make_plant(self, params):
+        import trackctl
+
+        if not trackctl.have_chrono:
+            raise RuntimeError("trackctl was built without Project Chrono: run scripts/install_chrono.sh, then setup.sh")
+        return trackctl.ChronoPlant(params)
 
     def _origin(self, x):
         X0, Y0 = frames.origin_from_cg(x[0], x[1], x[2], self.circuit.body.cg_to_center)
@@ -224,4 +235,20 @@ class ChronoDynamics:
         self.actor.destroy()
 
 
-DYNAMICS = {"carla": CarlaDynamics, "chrono": ChronoDynamics}
+class BicycleDynamics(ChronoDynamics):
+    """The ego car on the controllers' own dynamic bicycle model (the offline plant), drawn in CARLA
+    flat on the road: the model has no roll, pitch or heave."""
+
+    name = "bicycle"
+
+    def _make_plant(self, params):
+        import trackctl
+
+        return trackctl.BicyclePlant(params)
+
+    def _pose(self):
+        X0, Y0, psi = self._origin(self.plant.observe())
+        self.actor.set_transform(transform(X0, Y0, psi, z=self.z))
+
+
+DYNAMICS = {"carla": CarlaDynamics, "chrono": ChronoDynamics, "bicycle": BicycleDynamics}

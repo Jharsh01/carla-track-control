@@ -120,6 +120,27 @@ PYBIND11_MODULE(trackctl, m) {
                                    auto* nmpc = dynamic_cast<NMPC*>(&d.controller());
                                    return nmpc ? nmpc->solve_times : std::vector<double>();
                                })
+        .def_property_readonly("solve_stats",
+                               [](Driver& d) {
+                                   py::list out;
+                                   if (auto* nmpc = dynamic_cast<NMPC*>(&d.controller()))
+                                       for (const auto& s : nmpc->solve_stats) {
+                                           py::dict r;
+                                           r["t"] = s.t, r["s0"] = s.s0, r["ux0"] = s.ux0;
+                                           r["t_wall"] = s.t_wall, r["t_total"] = s.t_total, r["t_proc"] = s.t_proc;
+                                           r["t_hess"] = s.t_hess, r["t_jac"] = s.t_jac, r["t_grad"] = s.t_grad;
+                                           r["t_f"] = s.t_f, r["t_g"] = s.t_g;
+                                           r["iterations"] = s.iterations, r["success"] = s.success;
+                                           r["status"] = s.status, r["warm"] = s.warm;
+                                           r["n_obstacles"] = s.n_obstacles, r["obj"] = s.obj;
+                                           r["slack_obstacle"] = s.slack_max[0], r["slack_edge"] = s.slack_max[1];
+                                           r["slack_sideslip"] = s.slack_max[2], r["slack_speed"] = s.slack_max[3];
+                                           r["x0_gap"] = s.x0_gap;
+                                           out.append(r);
+                                       }
+                                   return out;
+                               },
+                               "per solve: a dict of NMPC::SolveStats (times in seconds)")
         .def_property_readonly("failures",
                                [](Driver& d) {
                                    auto* nmpc = dynamic_cast<NMPC*>(&d.controller());

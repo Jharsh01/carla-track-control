@@ -107,11 +107,108 @@ def test_pure_pursuit_laps_on_chrono_dynamics(tmp_path):
     assert status == 0 and r["completed"] and not r["collided"]
 
 
+@pytest.mark.slow
+def test_nmpc_laps_on_bicycle_dynamics(tmp_path):
+    status, r = lap("nmpc", "bicycle", tmp_path, "--no-video")
+    assert status == 0 and r["completed"] and not r["collided"]
+
+
+def video_size(path):
+    import imageio_ffmpeg
+
+    reader = imageio_ffmpeg.read_frames(str(path))
+    size = next(reader)["size"]
+    reader.close()
+    return size
+
+
+def test_rate_panel_widens_the_video(tmp_path):
+    from carla_bridge.view import RatePanel
+
+    lap("pure_pursuit", "carla", tmp_path, "--t-max", "0.5")
+    assert video_size(tmp_path / "pure_pursuit_carla.mp4") == (1280 + RatePanel.WIDTH, 720)
+    lap("pure_pursuit", "carla", tmp_path, "--t-max", "0.5", "--no-rates")
+    assert video_size(tmp_path / "pure_pursuit_carla.mp4") == (1280, 720)
+
+
+def test_rate_panel_averages():
+    from carla_bridge.view import RatePanel
+
+    panel = RatePanel(0.05)
+    for i in range(40):
+        panel.add(0.05 * (i + 1), 0.1, 0.02)  # the controller at 10 Hz, the plant at 50 Hz
+    assert panel.average("controller") == pytest.approx(10.0)
+    assert panel.average("plant") == pytest.approx(50.0)
+    assert panel.draw(np.zeros((720, 1280, 3), np.uint8)).shape == (720, 1280 + RatePanel.WIDTH, 3)
+
+
 def test_video_is_written(tmp_path):
     status, r = lap("pure_pursuit", "carla", tmp_path, "--t-max", "1.0")
     assert not r["completed"]  # stopped by the time limit
     video = tmp_path / "pure_pursuit_carla.mp4"
     assert video.exists() and video.stat().st_size > 0
+    assert carla.calls["textured"] and carla.calls["weather"]  # the scenery was built
+
+
+def _covered(planes, x, y):
+    """For each point (x[i], y[i]), whether one of the flat planes covers it."""
+    out = np.zeros(len(x), dtype=bool)
+    for px, py, _, psi, scale, vertical in planes:
+        assert not vertical
+        dx, dy = x - px, y - py
+        along = dx * math.cos(psi) + dy * math.sin(psi)
+        across = -dx * math.sin(psi) + dy * math.cos(psi)
+        out |= (np.abs(along) <= 5.0 * scale) & (np.abs(across) <= 6.0 * scale)
+    return out
+
+
+def test_scenery_draws_the_road():
+    from carla_bridge import scenery
+
+    track = CIRCUIT.track
+    plan = scenery.layout(CIRCUIT)
+    half = CIRCUIT.lane_width
+    tol = scenery.TOLERANCE
+
+    def points(e):
+        poses = [track.pose(s, e) for s in np.arange(0.0, track.length, 0.5)]
+        return np.array([p.x for p in poses]), np.array([p.y for p in poses])
+
+    # asphalt everywhere on the road and the white layer under its edges, but for the scallops of up to
+    # tol that the rows of planes leave on the inside of a corner
+    for e in np.linspace(-half + tol, half - tol, 9):
+        assert _covered(plan.planes["asphalt"], *points(e)).all(), e
+    for e in (-half - scenery.WHITE_LINE + tol, half + scenery.WHITE_LINE - tol):
+        assert _covered(plan.planes["white"], *points(e)).all(), e
+    # the asphalt stays within the tolerance of its edge, so most of each edge line shows
+    for e in (-half - tol - 0.01, half + tol + 0.01):
+        assert not _covered(plan.planes["asphalt"], *points(e)).any(), e
+    for e in (-half - scenery.WHITE_LINE - tol - 0.01, half + scenery.WHITE_LINE + tol + 0.01):
+        assert not _covered(plan.planes["white"], *points(e)).any(), e
+    # kerbs on the corners only, both sides
+    kerbs = plan.planes["kerb_red"] + plan.planes["kerb_white"]
+    for x, y, *_ in kerbs:
+        s, e = track.project(x, y)
+        assert track.curvature(s) != 0.0 and half < abs(e) < CIRCUIT.lane_width + CIRCUIT.grass_width
+    # nothing to drive into: barriers outside the walls, trees and the crowd well beyond them
+    e_wall = CIRCUIT.lane_width + CIRCUIT.grass_width
+    for path, x, y, *_ in plan.meshes:
+        clear = e_wall if path == scenery.GUARDRAIL else e_wall + 2.0
+        assert abs(track.project(x, y)[1]) >= clear - 1e-6, path
+    for x, y, *_ in plan.walkers:
+        assert abs(track.project(x, y)[1]) > e_wall + 5.0
+
+
+def test_scenery_textures_tile():
+    from carla_bridge import scenery
+
+    for name, image in scenery.textures().items():
+        assert image.dtype == np.uint8 and image.ndim == 3 and image.shape[2] == 3, name
+        # the grass and asphalt repeat over their planes: their opposite edges must match
+        if image.shape[0] > 4:
+            edge = np.abs(image[0].astype(int) - image[-1].astype(int)).mean()
+            inner = np.abs(image[0].astype(int) - image[1].astype(int)).mean()
+            assert edge < 3.0 * inner + 1.0, name
 
 
 def test_live_stream_serves_frames():

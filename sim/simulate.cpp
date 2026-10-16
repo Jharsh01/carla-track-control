@@ -15,13 +15,16 @@
 //   simulate --speed-limit 60                 the ego's speed limit [km/h] instead of the track's
 //   simulate --out DIR                        where the logs go (default results/offline)
 //
-// Each run writes <out>/<controller>_<plant>.csv (one row per 10 ms) and a .json with its result.
+// Each run writes <out>/<controller>_<plant>.csv (one row per 10 ms) and a .json with its result; the
+// NMPC also writes <controller>_<plant>_solves.csv, one row per solve (README.md, "Solve-time logs").
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <nlohmann/json.hpp>
@@ -40,6 +43,8 @@ using nlohmann::json;
 namespace fs = std::filesystem;
 
 namespace {
+
+constexpr double CONTROL_PERIOD = 0.05;  // run_lap's default dt_ctrl [s]
 
 struct Args {
     std::string controller = "both";
@@ -114,6 +119,56 @@ std::unique_ptr<PlantModel> make_plant(const std::string& name, const VehiclePar
 
 json optional(const std::optional<double>& value) { return value ? json(*value) : json(nullptr); }
 
+// One row per NMPC solve, the columns of carla_bridge/run.py's SOLVE_COLUMNS.
+void write_solves(const fs::path& file, const std::vector<NMPC::SolveStats>& stats) {
+    fs::create_directories(file.parent_path());
+    std::ofstream out(file);
+    out << "t,s0,ux0,t_wall,t_total,t_proc,t_hess,t_jac,t_grad,t_f,t_g,iterations,success,status,warm,n_obstacles,obj,"
+           "slack_obstacle,slack_edge,slack_sideslip,slack_speed,x0_gap\n"
+        << std::setprecision(9);
+    for (const auto& s : stats) {
+        out << s.t << ',' << s.s0 << ',' << s.ux0 << ',' << s.t_wall << ',' << s.t_total << ',' << s.t_proc << ','
+            << s.t_hess << ',' << s.t_jac << ',' << s.t_grad << ',' << s.t_f << ',' << s.t_g << ',' << s.iterations
+            << ',' << (s.success ? "True" : "False") << ',' << s.status << ',' << (s.warm ? "True" : "False") << ','
+            << s.n_obstacles << ',' << s.obj;
+        for (double slack : s.slack_max) out << ',' << slack;
+        out << ',' << s.x0_gap << '\n';
+    }
+}
+
+// Where the solve time went over all solves of a lap: the keys carla_bridge/run.py's solve_breakdown writes.
+json solve_breakdown(const std::vector<NMPC::SolveStats>& stats, double dt) {
+    if (stats.empty()) return json::object();
+    std::vector<double> wall;
+    double total = 0.0, proc = 0.0, hess = 0.0, jac = 0.0, grad = 0.0, f = 0.0, g = 0.0, iters = 0.0;
+    int iter_max = 0, overruns = 0;
+    std::map<std::string, int> statuses;
+    for (const auto& s : stats) {
+        wall.push_back(s.t_wall);
+        total += s.t_total, proc += s.t_proc;
+        hess += s.t_hess, jac += s.t_jac, grad += s.t_grad, f += s.t_f, g += s.t_g;
+        iters += s.iterations;
+        iter_max = std::max(iter_max, s.iterations);
+        overruns += s.t_wall > dt;
+        ++statuses[s.status];
+    }
+    std::vector<double> sorted = wall;
+    std::sort(sorted.begin(), sorted.end());
+    auto percentile = [&](double q) {  // linear interpolation, as numpy's default
+        const double pos = q / 100.0 * (sorted.size() - 1);
+        const size_t lo = static_cast<size_t>(std::floor(pos)), hi = std::min(lo + 1, sorted.size() - 1);
+        return sorted[lo] + (pos - lo) * (sorted[hi] - sorted[lo]);
+    };
+    auto share = [&](double part) { return total > 0.0 ? part / total : 0.0; };
+    const json shares = {{"hess", share(hess)}, {"jac", share(jac)}, {"grad", share(grad)}, {"f", share(f)},
+                         {"g", share(g)},  // the rest: linear solves and IPOPT's own work
+                         {"ipopt_internal", total > 0.0 ? 1.0 - share(hess + jac + grad + f + g) : 0.0}};
+    return {{"solve_p50", percentile(50)}, {"solve_p95", percentile(95)},
+            {"overrun_fraction", double(overruns) / stats.size()}, {"iter_mean", iters / stats.size()},
+            {"iter_max", iter_max}, {"time_share", shares}, {"proc_over_wall", share(proc)},
+            {"status_counts", statuses}, {"first_solve", wall.front()}};
+}
+
 void write_log(const fs::path& file, const LapLog& log) {
     fs::create_directories(file.parent_path());
     std::ofstream out(file);
@@ -137,14 +192,34 @@ void run(const Args& a, const std::string& name, const Circuit& circuit, const V
     auto plant = make_plant(a.plant, params);
     const auto [log, r] = run_lap(circuit, std::ref(driver), *plant);
 
-    std::string solves;
-    if (auto* nmpc = dynamic_cast<NMPC*>(&driver.controller())) {
+    std::string solves, solve_detail;
+    json solve_summary = json::object();
+    auto* nmpc = dynamic_cast<NMPC*>(&driver.controller());
+    if (nmpc) {
         double sum = 0.0, max = 0.0;
         for (double t : nmpc->solve_times) sum += t, max = std::max(max, t);
         char text[128];
         std::snprintf(text, sizeof text, "   | solve mean %.0f ms, max %.0f ms, %d not converged",
                       1e3 * sum / nmpc->solve_times.size(), 1e3 * max, nmpc->failures);
         solves = text;
+        solve_summary = {{"solve_mean", sum / nmpc->solve_times.size()}, {"solve_max", max},
+                         {"not_converged", nmpc->failures}};
+        solve_summary.update(solve_breakdown(nmpc->solve_stats, CONTROL_PERIOD));
+        if (solve_summary.contains("time_share")) {
+            const json& b = solve_summary;
+            const json& share = b["time_share"];
+            char detail[256];
+            std::snprintf(detail, sizeof detail,
+                          "%-13s solve p50 %.0f ms, p95 %.0f ms, over dt %.0f%%   iterations mean %.1f, max %d"
+                          "   time in hessian %.0f%%, jacobian %.0f%%, ipopt %.0f%%"
+                          "   cpu/wall %.2f   first solve %.0f ms\n",
+                          "", 1e3 * b["solve_p50"].get<double>(), 1e3 * b["solve_p95"].get<double>(),
+                          100 * b["overrun_fraction"].get<double>(), b["iter_mean"].get<double>(),
+                          b["iter_max"].get<int>(), 100 * share["hess"].get<double>(), 100 * share["jac"].get<double>(),
+                          100 * share["ipopt_internal"].get<double>(), b["proc_over_wall"].get<double>(),
+                          1e3 * b["first_solve"].get<double>());
+            solve_detail = detail;
+        }
     }
     char outcome[32] = "   none";
     if (r.completed) std::snprintf(outcome, sizeof outcome, "%6.1f s", *r.lap_time);
@@ -154,18 +229,19 @@ void run(const Args& a, const std::string& name, const Circuit& circuit, const V
                 name.c_str(), outcome, 3.6 * r.min_speed, 3.6 * r.max_speed, passed, circuit.traffic.size(),
                 r.min_clearance, r.road_margin, r.time_on_grass, r.peak_sideslip * 180.0 / M_PI, solves.c_str());
     if (r.collided || r.left_track) std::printf("   %s at %.1f s", r.collided ? "collision" : "left the track", log.t.back());
-    std::printf("\n");
+    std::printf("\n%s", solve_detail.c_str());
 
     const fs::path file = fs::path(a.out) / (name + "_" + a.plant + ".csv");
     write_log(file, log);
-    std::ofstream(fs::path(file).replace_extension(".json"))
-        << json{{"controller", name}, {"plant", a.plant}, {"completed", r.completed},
-                {"lap_time", optional(r.lap_time)}, {"collided", r.collided}, {"left_track", r.left_track},
-                {"min_clearance", r.min_clearance}, {"road_margin", r.road_margin},
-                {"time_on_grass", r.time_on_grass}, {"peak_sideslip", r.peak_sideslip},
-                {"min_speed", r.min_speed}, {"max_speed", r.max_speed}, {"passed", passed}}
-               .dump(2)
-        << '\n';
+    if (nmpc && !nmpc->solve_stats.empty())
+        write_solves(fs::path(a.out) / (name + "_" + a.plant + "_solves.csv"), nmpc->solve_stats);
+    json result = {{"controller", name}, {"plant", a.plant}, {"completed", r.completed},
+                   {"lap_time", optional(r.lap_time)}, {"collided", r.collided}, {"left_track", r.left_track},
+                   {"min_clearance", r.min_clearance}, {"road_margin", r.road_margin},
+                   {"time_on_grass", r.time_on_grass}, {"peak_sideslip", r.peak_sideslip},
+                   {"min_speed", r.min_speed}, {"max_speed", r.max_speed}, {"passed", passed}};
+    result.update(solve_summary);
+    std::ofstream(fs::path(file).replace_extension(".json")) << result.dump(2) << '\n';
 }
 
 }  // namespace

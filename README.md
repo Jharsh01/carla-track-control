@@ -27,6 +27,22 @@ the road's shape known only 40 m ahead (`--perfect` turns that off).
 In CARLA the track is generated from OpenDRIVE at start-up (`client.generate_opendrive_world`),
 so no extra map download is needed and the road CARLA draws is the path the controllers follow.
 
+CARLA draws that generated road and its walls in one flat untextured material over an empty void,
+so the bridge hides them (they still collide) and draws the circuit itself
+(`carla_bridge/scenery.py`):
+
+- dark asphalt with white edge lines
+- red and white kerbs on every corner
+- a chequered start line
+- mown grass to the horizon
+- Armco along the walls
+- woods, and a grandstand with a crowd and sponsor boards on the start straight
+
+All of it is CARLA's own meshes and textured planes, spawned when the world loads. That adds about
+3,400 actors and about 8 s at start-up; on an L4 a world tick then takes about 17 ms, well under
+the NMPC's solve time. `--no-scenery` brings back the
+plain road.
+
 ## Quick start on NVIDIA Brev
 
 1. Create a GPU instance in **VM mode** (CARLA refuses to run as root, and VM mode gives you the
@@ -60,11 +76,13 @@ ssh -L 8080:localhost:8080 <instance>      # on your laptop
 | | |
 |---|---|
 | `--controller nmpc\|pure_pursuit\|both` | which controller(s) to run, one after the other (default both) |
-| `--dynamics carla\|chrono` | who simulates the ego car (default carla) |
+| `--dynamics carla\|chrono\|bicycle` | who simulates the ego car (default carla) |
 | `--perfect` | exact sensing, the whole road known |
 | `--road-range M`, `--seed N` | how far ahead the road is known; the noise seed |
 | `--laps N`, `--t-max S` | |
 | `--stream PORT`, `--no-video` | live view; no camera at all (fastest) |
+| `--no-rates` | no side panel plotting the controller's and the plant's rate in wall-clock Hz |
+| `--no-scenery` | CARLA's plain generated road instead of the drawn circuit |
 | `--docker` | start CARLA from the `carlasim/carla:0.9.15` image instead of `external/carla` |
 | `--offline` | no CARLA: the C++ simulation (`build/simulate -h`) |
 | `--stop-carla` | stop the server (it is left running between runs) |
@@ -83,7 +101,13 @@ PAC2002 tires, driveline), stepped inside the bridge at 1 ms; CARLA only draws t
 Chrono's roll and pitch. The controllers plan with `config/vehicles/chrono_sedan.json`, identified
 from the Chrono model. The grass's lower friction applies here only: CARLA's surface is uniform.
 
-The controllers see the same thing in both cases: the state at the centre of gravity in a
+**`--dynamics bicycle`**: the offline plant (the controllers' own dynamic bicycle model with the
+actuator lags, `config/vehicles/model3.json`), stepped inside the bridge like Chrono and drawn
+flat on the road. The car does what the NMPC predicts, so this shows the offline bicycle laps in
+the CARLA scenery rather than testing the controllers against a different car. The grass's
+friction applies here too.
+
+The controllers see the same thing in every case: the state at the centre of gravity in a
 right-handed frame (`carla_bridge/frames.py` converts from CARLA's left-handed one) and the other
 cars in track coordinates.
 
@@ -103,6 +127,35 @@ NMPC solves averaged 55-135 ms in these runs (several running at once on one mac
 50 ms control period; the simulation is synchronous, so this slows it down rather than changing it.
 A few solves per lap on Chrono end without converging (11 in the default run); their result is
 applied anyway.
+
+#### Solve-time logs
+
+Every NMPC run, offline (`build/simulate`) or in CARLA, also writes `<controller>_<dynamics>_solves.csv`.
+It has one row per solve, with these columns:
+
+| column | meaning |
+|---|---|
+| `t`, `s0`, `ux0` | time [s], path position [m] and measured speed [m/s] at the solve |
+| `t_wall` | wall time around the solver call [s] (what `solve_mean` averages) |
+| `t_total`, `t_proc` | IPOPT's own wall and CPU time [s] |
+| `t_hess`, `t_jac`, `t_grad`, `t_f`, `t_g` | time in the Lagrangian Hessian, constraint Jacobian, cost gradient, cost and constraints [s] |
+| `iterations`, `success`, `status` | IPOPT iterations, convergence and return status |
+| `warm` | started from the previous solution |
+| `n_obstacles` | detected cars in the problem |
+| `obj` | final cost |
+| `slack_obstacle`, `slack_edge`, `slack_sideslip`, `slack_speed` | largest slack of each soft constraint over the horizon |
+| `x0_gap` | distance between the initial guess's first state and the measured one |
+
+The result `.json` adds these keys next to `solve_mean`/`solve_max`/`not_converged`:
+- `solve_p50` and `solve_p95`
+- `overrun_fraction`: the share of solves longer than the control period
+- `iter_mean` and `iter_max`
+- `time_share`: hess, jac, grad, f, g and `ipopt_internal` (linear solves and the rest) as fractions of IPOPT's time
+- `proc_over_wall`: CPU over wall time. Well below 1 means the solver was waiting for a CPU; above 1 means threaded linear algebra.
+- `status_counts`
+- `first_solve`: the cold start
+
+The run summary prints them as a second line.
 
 ### Making the NMPC drive the Chrono car
 
@@ -132,7 +185,8 @@ sim/                      offline simulation, shared with the CARLA bridge
   racetrack/                the circuit, perception (noise, range), the driver glue, the lap runner
   simulate.cpp              build/simulate
 bindings/trackctl.cpp     Python module (controllers, track, plants) for the bridge
-carla_bridge/             CARLA side: OpenDRIVE world, frames, actuation, dynamics backends, camera/HUD/video
+carla_bridge/             CARLA side: OpenDRIVE world, scenery, frames, actuation, dynamics backends,
+                            camera/HUD/video
 config/                   racetrack.json, vehicles/*.json, tuning.json (NMPC margins per dynamics)
 scripts/                  install_chrono.sh, install_carla.sh, start_carla.sh, fit_chrono_tires.py
 tests/                    the bridge against a stand-in carla module (tests/fake_carla)

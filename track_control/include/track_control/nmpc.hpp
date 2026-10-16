@@ -29,6 +29,7 @@
 #include <Eigen/Dense>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "track_control/controller.hpp"
@@ -82,11 +83,34 @@ public:
     const int N;
     const double unseen_speed;
 
+    // One per solve, for finding out where the solve time goes.
+    struct SolveStats {
+        double t = 0.0;  // time of the observation [s]
+        double s0 = 0.0, ux0 = 0.0;  // measured path position [m] and speed [m/s]
+        int iterations = 0;
+        double t_wall = 0.0;  // wall time around the solver call [s], as in solve_times
+        double t_total = 0.0;  // the solver's own wall time [s]
+        double t_proc = 0.0;  // the solver's CPU time [s]: well below t_total when the process waits for a CPU
+        double t_hess = 0.0, t_jac = 0.0, t_grad = 0.0, t_f = 0.0, t_g = 0.0;  // in function evaluations [s]
+        bool success = false;
+        std::string status;  // the solver's return status, e.g. Maximum_Iterations_Exceeded
+        bool warm = false;  // started from the previous solution
+        int n_obstacles = 0;  // detected cars in the problem (the other slots are parked out of reach)
+        double obj = 0.0;  // final cost
+        double slack_max[NS] = {};  // largest slack of each kind over the horizon
+        double x0_gap = 0.0;  // |x_0 - x_init| of the initial guess: how far the warm start was off
+    };
     std::vector<double> solve_times;  // wall time of each solve [s]
+    std::vector<SolveStats> solve_stats;
     int failures = 0;  // solves that did not converge; their result is still applied
     Eigen::MatrixXd plan;  // last predicted states in path coordinates, (N + 1) x NX; empty before the first solve
 
 private:
+    // where stage k's state, input and slacks are in the decision variables [x_0 u_0 s_0 ... x_N]
+    int x_at(int k) const { return k * (NX + NU + NS); }
+    int u_at(int k) const { return x_at(k) + NX; }
+    int n_w() const { return x_at(N) + NX; }
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

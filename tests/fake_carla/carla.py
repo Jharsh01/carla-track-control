@@ -9,6 +9,8 @@ only ENGINE_EFFICIENCY of the force the throttle asks for, and a steering
 servo, so that the bridge's frame conversions, actuation and feedback are
 exercised end to end. Cameras deliver black images.
 
+Static props, pedestrians and textures (the scenery) are only recorded.
+
 Not CARLA: no rendering, no collisions, no tire model of CARLA's own.
 """
 import math
@@ -24,7 +26,7 @@ import trackctl  # noqa: E402
 ENGINE_EFFICIENCY = 0.85
 CG_AHEAD = 0.45  # Model 3: centre of mass ahead of the actor origin [m]
 MAX_STEER_DEG = 70.0
-calls = {"generate_opendrive_world": [], "draw_line": 0, "settings": []}
+calls = {"generate_opendrive_world": [], "draw_line": 0, "settings": [], "textured": {}, "weather": []}
 
 
 class Vector3D:
@@ -69,6 +71,46 @@ class VehicleControl:
 
 class WeatherParameters:
     ClearNoon = "ClearNoon"
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+
+class FloatColor(Color):
+    pass
+
+
+class TextureColor:
+    def __init__(self, width, height):
+        self.width, self.height = width, height
+        self.pixels = {}
+
+    def set(self, x, y, color):
+        assert 0 <= x < self.width and 0 <= y < self.height
+        self.pixels[x, y] = color
+
+
+class TextureFloatColor(TextureColor):
+    pass
+
+
+class MaterialParameter:
+    Normal, AO_Roughness_Metallic_Emissive, Diffuse, Emissive = range(4)
+
+
+class command:
+    class SpawnActor:
+        def __init__(self, blueprint, transform, parent=None):
+            self.blueprint, self.transform = blueprint, transform
+
+    class SetSimulatePhysics:
+        def __init__(self, actor, enabled):
+            self.actor, self.enabled = actor, enabled
+
+
+class Response:
+    def __init__(self, actor_id=0, error=""):
+        self.actor_id, self.error = actor_id, error
 
 
 class AttachmentType:
@@ -266,6 +308,7 @@ class World:
         self.frame = 0
         self.debug = Debug()
         self.spectator = Actor(self, Blueprint("spectator"), Transform())
+        self.props = []  # static meshes and pedestrians: never moved, not stepped
 
     def get_settings(self):
         s = WorldSettings()
@@ -278,14 +321,27 @@ class World:
         return self.frame
 
     def set_weather(self, weather):
-        pass
+        calls["weather"].append(weather)
 
     def get_blueprint_library(self):
         class Library:
             def find(self, id):
                 return CameraBlueprint(id) if id.startswith("sensor") else Blueprint(id)
 
+            def filter(self, pattern):
+                return [Blueprint(pattern.replace("*", "%04d" % i)) for i in range(1, 4)]
+
         return Library()
+
+    def get_names_of_all_objects(self):
+        return ["BP_Sky"] + ["StaticMeshActor_%d" % i for i in range(len(self.props))]
+
+    def apply_color_texture_to_objects(self, names, parameter, texture):
+        for name in names:
+            calls["textured"][name] = texture
+
+    def apply_float_color_texture_to_objects(self, names, parameter, texture):
+        pass
 
     def get_spectator(self):
         return self.spectator
@@ -330,3 +386,16 @@ class Client:
 
     def get_world(self):
         return self.world
+
+    def apply_batch_sync(self, commands, do_tick=False):
+        responses = []
+        for c in commands:
+            if isinstance(c, command.SpawnActor):
+                assert c.blueprint.id.startswith(("static.", "walker.")), c.blueprint.id
+                self.world.props.append(Actor(self.world, c.blueprint, c.transform))
+                responses.append(Response(actor_id=len(self.world.props)))
+            else:
+                responses.append(Response(actor_id=c.actor))
+        if do_tick:
+            self.world.tick()
+        return responses
