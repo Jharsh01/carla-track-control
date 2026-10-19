@@ -47,6 +47,9 @@ plain road.
 
 1. Create a GPU instance in **VM mode** (CARLA refuses to run as root, and VM mode gives you the
    `ubuntu` user), Ubuntu 22.04, a GPU with 16 GB or more (L4, A10G), about 60 GB of disk.
+   Brev's image comes with the NVIDIA driver; on a plain cloud image install it first
+   (`sudo apt-get install -y nvidia-driver-580-server nvidia-utils-580-server && sudo modprobe nvidia`).
+   `./setup.sh` stops at the start if `nvidia-smi` or Vulkan cannot see the GPU.
 2. On the instance:
 
    ```bash
@@ -81,7 +84,11 @@ ssh -L 8080:localhost:8080 <instance>      # on your laptop
 | `--road-range M`, `--seed N` | how far ahead the road is known; the noise seed |
 | `--laps N`, `--t-max S` | |
 | `--stream PORT`, `--no-video` | live view; no camera at all (fastest) |
-| `--no-rates` | no side panel plotting the controller's and the plant's rate in wall-clock Hz |
+| `--no-rates` | no side panel plotting the controller's and the plant's rate in wall-clock Hz (and the CARLA world's, threaded) |
+| `--controller nmpc_fallback` | with `--dynamics bicycle`: the NMPC and pure pursuit both running, pure pursuit's input sent whenever the NMPC is late (below) |
+| `--control-rate HZ`, `--nmpc-deadline S` | threaded: how often an input is sent (default 100 Hz); how long an NMPC solve may take (default 0.1 s) |
+| `--lockstep` | with `--dynamics bicycle`: one loop (controller, plant, CARLA tick) instead of three threads |
+| `--plant-rate HZ`, `--world-rate HZ` | the threaded bicycle plant's rate (default 1000); the CARLA world thread's: ticks, camera frames, video (default 25) |
 | `--no-scenery` | CARLA's plain generated road instead of the drawn circuit |
 | `--docker` | start CARLA from the `carlasim/carla:0.9.15` image instead of `external/carla` |
 | `--offline` | no CARLA: the C++ simulation (`build/simulate -h`) |
@@ -100,12 +107,52 @@ absorbs the engine map (`carla_bridge/actuation.py`).
 PAC2002 tires, driveline), stepped inside the bridge at 1 ms; CARLA only draws the car, with
 Chrono's roll and pitch. The controllers plan with `config/vehicles/chrono_sedan.json`, identified
 from the Chrono model. The grass's lower friction applies here only: CARLA's surface is uniform.
+How the plant works, why each step needs a solver and where its time goes:
+[`docs/chrono_plant.pdf`](docs/chrono_plant.pdf).
 
 **`--dynamics bicycle`**: the offline plant (the controllers' own dynamic bicycle model with the
-actuator lags, `config/vehicles/model3.json`), stepped inside the bridge like Chrono and drawn
-flat on the road. The car does what the NMPC predicts, so this shows the offline bicycle laps in
-the CARLA scenery rather than testing the controllers against a different car. The grass's
-friction applies here too.
+actuator lags, `config/vehicles/model3.json`), stepped in real time on its own thread (below;
+`--lockstep`: inside the bridge's loop like Chrono) and drawn flat on the road. In lockstep the
+car does what the NMPC predicts, so this shows the offline bicycle laps in the CARLA scenery
+rather than testing the controllers against a different car; threaded, it also tests them against
+their own computation time. The grass's
+friction applies here too. The model's equations, tire curves, lags and limits:
+[`docs/bicycle_plant.pdf`](docs/bicycle_plant.pdf).
+
+The bicycle plant can also run in real time on its own thread (`BicyclePlant::start`, 1 kHz by
+default), woken by a periodic kernel timer at absolute deadlines so the rate does not drift; a
+late tick is caught up, so plant time stays wall-clock time. Its state is the global
+`sim::bicycle_state` (`state()`, `bicycle_state[IUX]`, `command(u)`, `mu`), which controllers
+read and command without ever blocking the plant. The thread asks for `SCHED_FIFO`, which needs
+root, `CAP_SYS_NICE` or an rtprio limit (`ulimit -r`); otherwise it runs at normal priority
+(`timing()` reports which, with the wake-up latency and overruns). The offline runs and the bridge
+step the plant themselves, except the bridge with `--dynamics bicycle`.
+
+With `--dynamics bicycle` the bridge runs three threads side by side in real time instead of one
+loop: the plant at 1 kHz on that timer thread, the controller at `--control-rate` (100 Hz) (its solve releases
+Python's GIL), and the CARLA world (draw the car, traffic and plan, camera, log, end of the lap)
+at `--world-rate` (25 Hz). They share the state and the input through `trackctl.bicycle_state`, each taking the
+latest value; nothing waits for anything else, and the rate panel shows the three rates as they
+are. A slow solve therefore leaves the car on its previous input, which the lockstep runs (the
+other dynamics, and `--lockstep`) hide by stopping the world during every solve. Pure pursuit laps
+the same in both; the NMPC, whose solves take about 100 ms and which does not yet compensate for
+that delay, does not keep the car on the track in real time.
+
+`--controller nmpc_fallback` runs both controllers at once (`sim/racetrack/fallback_control.hpp`,
+all in C++): the NMPC solving back to back, each solve given `--nmpc-deadline` and planning from
+where the car will be when that time is up (predicted with the bicycle model), pure pursuit every
+10 ms, and a command thread that every 10 ms sends the NMPC's planned input for that moment while
+its solves converge within the deadline, and pure pursuit's latest input otherwise. An input goes
+out every 10 ms whatever the NMPC does. The HUD's banner says whose it is (green NMPC with the
+plan's age, orange pure pursuit with the reason), the rate panel shows all five threads, the
+`.csv` has a `command` column and the `.json` the NMPC's share of the commands.
+
+Measured against the stand-in CARLA on an 8-core VM: with the 100 ms deadline almost no solve
+makes it (IPOPT gets about 9 of the 13 iterations it needs in 100 ms with everything else
+running), so pure pursuit drives and laps cleanly. With 200 ms the NMPC sends about half the
+commands, but handing over between the two in the middle of a manoeuvre (different lines, pure
+pursuit braking hard in a turn) has spun the car in 2 of 3 runs. How all of this was built and
+measured: [`docs/realtime_control_report.md`](docs/realtime_control_report.md).
 
 The controllers see the same thing in every case: the state at the centre of gravity in a
 right-handed frame (`carla_bridge/frames.py` converts from CARLA's left-handed one) and the other
@@ -196,7 +243,8 @@ setup.sh, run.sh
 ## Tests
 
 ```bash
-ctest --test-dir build                       # the library: paths, model, controllers in closed loop
+ctest --test-dir build                       # the library: paths, model, controllers in closed loop;
+                                             # the bicycle plant's real-time thread
 .venv/bin/python -m pytest -m "not slow"     # the bridge: OpenDRIVE geometry, frames, actuation, video
 .venv/bin/python -m pytest -m slow           # whole laps through the bridge against the stand-in CARLA
 ```

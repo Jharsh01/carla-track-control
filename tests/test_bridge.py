@@ -109,8 +109,68 @@ def test_pure_pursuit_laps_on_chrono_dynamics(tmp_path):
 
 @pytest.mark.slow
 def test_nmpc_laps_on_bicycle_dynamics(tmp_path):
-    status, r = lap("nmpc", "bicycle", tmp_path, "--no-video")
+    status, r = lap("nmpc", "bicycle", tmp_path, "--no-video", "--lockstep")
     assert status == 0 and r["completed"] and not r["collided"]
+
+
+def test_bicycle_plant_thread_shares_its_state():
+    import time
+
+    params = trackctl.VehicleParams.from_file(os.path.join(REPO, "config", "vehicles", "model3.json"))
+    plant = trackctl.BicyclePlant(params)
+    plant.reset(CIRCUIT.initial_state())
+    trackctl.bicycle_state.command(np.array([0.0, 2000.0]))
+    plant.start(circuit=CIRCUIT)
+    time.sleep(0.3)
+    plant.stop()
+    t, x = trackctl.bicycle_state.state()
+    assert not plant.running
+    timing = plant.timing()
+    assert 0.25 < t < 0.6 and t == pytest.approx(1e-3 * timing["ticks"])  # plant time is wall-clock time
+    assert x[3] > CIRCUIT.initial_state()[3]  # the commanded drive force sped it up
+    assert trackctl.bicycle_state.mu == CIRCUIT.mu_road  # the friction under it, looked up by the plant
+    assert trackctl.bicycle_state.applied[1] == pytest.approx(2000.0)
+
+
+def test_threads_run_side_by_side(tmp_path, capsys):
+    import re
+
+    status, r = lap("pure_pursuit", "bicycle", tmp_path, "--no-video", "--t-max", "2")
+    assert not r["collided"] and not r["left_track"]
+    line = re.search(r"threads over .* plant ([\d.]+) Hz.*controller ([\d.]+) Hz, CARLA world ([\d.]+) Hz",
+                     capsys.readouterr().out)
+    plant, controller, world = map(float, line.groups())
+    assert plant == pytest.approx(1000.0, rel=0.05)
+    assert controller == pytest.approx(100.0, rel=0.2) and world == pytest.approx(25.0, rel=0.2)
+
+
+def test_nmpc_with_pure_pursuit_fallback(tmp_path, capsys):
+    import re
+
+    status, r = lap("nmpc_fallback", "bicycle", tmp_path, "--t-max", "3", "--no-video")
+    assert not r["collided"] and not r["left_track"]
+    out = capsys.readouterr().out
+    rates = re.search(r"command ([\d.]+) Hz \(NMPC (\d+), pure pursuit (\d+)\), NMPC [\d.]+ solves/s "
+                      r"\((\d+) of (\d+) on time\), pure pursuit ([\d.]+) Hz", out)
+    command, nmpc, pure_pursuit, on_time, solves, pure_pursuit_rate = map(float, rates.groups())
+    assert command == pytest.approx(100.0, rel=0.1)  # a command every 10 ms, whoever's it is
+    assert pure_pursuit_rate == pytest.approx(100.0, rel=0.1) and solves > 0
+    assert nmpc + pure_pursuit >= 0.9 * 100 * 3 and pure_pursuit > 0
+    assert r["nmpc_command_share"] == pytest.approx(nmpc / (nmpc + pure_pursuit))
+    with open(tmp_path / "nmpc_fallback_bicycle.csv") as f:
+        assert {row["command"] for row in __import__("csv").DictReader(f)} <= {"nmpc", "pure_pursuit", "none"}
+
+
+def test_command_banner():
+    from carla_bridge.view import COMMAND_COLORS, command_banner
+
+    status = {"source": "pure_pursuit", "reason": "NMPC took 130 ms > 100 ms", "plan_age": 0.0, "last_solve": 0.13,
+              "ticks": 10, "nmpc_ticks": 4}
+    text, detail, color = command_banner(status, 0.1)
+    assert "PURE PURSUIT" in text and "130 ms" in detail and "40%" in detail and color == COMMAND_COLORS["pure_pursuit"]
+    status.update(source="nmpc", plan_age=0.043)
+    text, detail, color = command_banner(status, 0.1)
+    assert text == "COMMAND: NMPC" and "43 ms" in detail and color == COMMAND_COLORS["nmpc"]
 
 
 def video_size(path):
@@ -140,6 +200,16 @@ def test_rate_panel_averages():
     assert panel.average("controller") == pytest.approx(10.0)
     assert panel.average("plant") == pytest.approx(50.0)
     assert panel.draw(np.zeros((720, 1280, 3), np.uint8)).shape == (720, 1280 + RatePanel.WIDTH, 3)
+
+    threads = RatePanel(0.05, series=RatePanel.THREADS, real_time={"plant": 1000.0})
+    for i in range(40):  # 2 s: the controller solved 30 times, the plant ticked 2000 times, the world 40
+        wall = 0.05 * (i + 1)
+        threads.add_counts(wall, {"controller": (int(15 * wall), wall), "plant": (int(1000 * wall), wall),
+                                  "world": (i + 1, wall)})
+    assert threads.average("controller") == pytest.approx(15.0)
+    assert threads.average("plant") == pytest.approx(1000.0)
+    assert threads.average("world") == pytest.approx(20.0)
+    assert threads.draw(np.zeros((720, 1280, 3), np.uint8)).shape == (720, 1280 + RatePanel.WIDTH, 3)
 
 
 def test_video_is_written(tmp_path):

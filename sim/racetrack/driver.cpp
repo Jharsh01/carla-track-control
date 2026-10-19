@@ -38,6 +38,7 @@ std::unique_ptr<Controller> make_controller(const std::string& name, const Circu
         o.lane_offset = home;
         o.road_range = road_range;
         o.sideslip_max = tuning.sideslip_max;
+        o.max_wall_time = tuning.solve_time_limit;
         VehicleParams planned = params;
         planned.mu *= tuning.mu_use;
         planned.F_brake_max *= tuning.brake_use;

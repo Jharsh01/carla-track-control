@@ -4,7 +4,29 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
+#include "track_control/model/tire.hpp"
+
 namespace tc {
+
+double LoadTable::operator()(double load) const { return cornering_stiffness(*this, 0.0, load); }
+
+namespace {
+
+LoadTable read_load_table(const nlohmann::json& entry, const std::string& where) {
+    LoadTable t;
+    if (!entry.contains("load_table")) return t;
+    t.Fz = entry.at("load_table").at("Fz").get<std::vector<double>>();
+    t.C_alpha = entry.at("load_table").at("C_alpha").get<std::vector<double>>();
+    if (t.Fz.empty() || t.Fz.size() != t.C_alpha.size())
+        throw std::runtime_error(where + ": load_table needs as many C_alpha as Fz values, at least one");
+    for (size_t i = 0; i < t.Fz.size(); ++i) {
+        if (i > 0 && !(t.Fz[i] > t.Fz[i - 1])) throw std::runtime_error(where + ": load_table Fz must increase");
+        if (!(t.C_alpha[i] > 0.0)) throw std::runtime_error(where + ": load_table C_alpha must be positive");
+    }
+    return t;
+}
+
+}  // namespace
 
 const std::vector<VehicleParams::Field>& VehicleParams::fields() {
     using P = VehicleParams;
@@ -60,13 +82,17 @@ VehicleParams VehicleParams::from_file(const std::string& path) {
         }
         p.*field.member = values.at(field.name).at("value");
     }
+    p.C_alpha_f_load = read_load_table(values.at("C_alpha_f"), path + ": C_alpha_f");
+    p.C_alpha_r_load = read_load_table(values.at("C_alpha_r"), path + ": C_alpha_r");
     return p;
 }
 
-double VehicleParams::understeer_gradient() const {
-    const double Wf = m * g * b / L();
-    const double Wr = m * g * a / L();
-    return (Wf / C_alpha_f - Wr / C_alpha_r) / g;
+double VehicleParams::understeer_gradient(double Fx) const {
+    // the cornering force each axle needs follows the weight distribution; the
+    // stiffness it has follows its load under the longitudinal load transfer (model/bicycle.hpp)
+    const double Fzf = (m * g * b - h * Fx) / L();
+    const double Fzr = (m * g * a + h * Fx) / L();
+    return m / L() * (b / C_alpha_f_at(Fzf) - a / C_alpha_r_at(Fzr));
 }
 
 }  // namespace tc

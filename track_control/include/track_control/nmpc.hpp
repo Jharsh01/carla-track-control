@@ -1,7 +1,8 @@
 // NMPC on the dynamic bicycle model, in path coordinates (CasADi + IPOPT).
 //
 // The dynamics of [Ux, Uy, r, delta] and the inputs [delta_rate, Fx] are the
-// bicycle model's (model/bicycle.hpp). The pose is carried relative to the
+// bicycle model's (model/bicycle.hpp), with each axle's cornering stiffness held
+// at its static-load value even if the parameters give a load table (`p`). The pose is carried relative to the
 // path instead of in the world frame,
 //
 //     state  [s, e_y, e_psi, Ux, Uy, r, delta]
@@ -62,6 +63,7 @@ public:
         double w_rate = 100.0;
         double w_slack = 1e3;
         int max_iter = 200;  // IPOPT iterations per solve
+        double max_wall_time = 0.0;  // [s] per solve, IPOPT stopping there (not converged); 0: no limit
     };
 
     NMPC(Path path, Road road, VehicleParams params, Body body, Options options);
@@ -76,7 +78,7 @@ public:
 
     const Path path;
     const Road road;
-    const VehicleParams p;
+    const VehicleParams p;  // as planned with: no load tables
     const Body body;
     const Options opt;
     const double h;
@@ -104,6 +106,8 @@ public:
     std::vector<SolveStats> solve_stats;
     int failures = 0;  // solves that did not converge; their result is still applied
     Eigen::MatrixXd plan;  // last predicted states in path coordinates, (N + 1) x NX; empty before the first solve
+    Eigen::MatrixXd plan_inputs;  // last planned inputs [delta_rate, Fx], N x NU, each held for h from obs.t + k h
+    bool last_success = false;  // the last solve converged
 
 private:
     // where stage k's state, input and slacks are in the decision variables [x_0 u_0 s_0 ... x_N]

@@ -26,6 +26,7 @@ struct Tuning {
     double brake_use = 1.0;
     double drive_use = 1.0;
     double sideslip_max = 7.0 * M_PI / 180.0;
+    double solve_time_limit = 0.0;  // [s] wall time an NMPC solve may take before it gives up; 0: no limit
 };
 
 // The NMPC margins for a vehicle dynamics ("bicycle", "chrono", "carla") from

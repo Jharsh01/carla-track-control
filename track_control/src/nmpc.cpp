@@ -25,6 +25,16 @@ double tightest_corner_speed(const Path& path, const Road& road, const VehiclePa
     return kappa_max > 0.0 ? std::sqrt(road.mu * p.g / kappa_max) : INF;
 }
 
+// The parameters planned with: cornering stiffness constant at the static load. Stiffness following
+// the load couples Fx into the tire model and about doubles the cost of a solve.
+VehicleParams constant_stiffness(VehicleParams p) {
+    const double Fzf = p.m * p.g * p.b / p.L(), Fzr = p.m * p.g * p.a / p.L();
+    p.C_alpha_f = p.C_alpha_f_at(Fzf);
+    p.C_alpha_r = p.C_alpha_r_at(Fzr);
+    p.C_alpha_f_load = p.C_alpha_r_load = LoadTable();
+    return p;
+}
+
 }  // namespace
 
 struct NMPC::Impl {
@@ -39,7 +49,7 @@ struct NMPC::Impl {
 NMPC::NMPC(Path path_, Road road_, VehicleParams params, Body body_, Options o)
     : path(std::move(path_)),
       road(road_),
-      p(params),
+      p(constant_stiffness(params)),
       body(body_),
       opt(o),
       h(o.h),
@@ -147,6 +157,7 @@ NMPC::NMPC(Path path_, Road road_, VehicleParams params, Body body_, Options o)
         {"ipopt.tol", 1e-6},
     };
     casadi::Dict opts = solver_options;
+    if (o.max_wall_time > 0.0) opts["ipopt.max_wall_time"] = o.max_wall_time;
     std::string plugin = "ipopt";
     if (const char* env = std::getenv("TC_NMPC_OPTS")) {  // EXPERIMENT
         std::string all(env), item;
@@ -300,6 +311,7 @@ Input NMPC::compute(const Observation& obs) {
         solve_stats.push_back(ss);
     }
     if (!success) ++failures;
+    last_success = success;
     m.x0 = sol.at("x").get_elements();
     m.lam_x0 = sol.at("lam_x");
     m.lam_g0 = sol.at("lam_g");
@@ -309,7 +321,9 @@ Input NMPC::compute(const Observation& obs) {
     plan.resize(N + 1, NX);
     for (int k = 0; k <= N; ++k)
         for (int i = 0; i < NX; ++i) plan(k, i) = w[x_at(k) + i];
-    return {w[u_at(0) + IRATE], p.m * w[u_at(0) + IFX]};
+    plan_inputs.resize(N, NU);
+    for (int k = 0; k < N; ++k) plan_inputs.row(k) << w[u_at(k) + IRATE], p.m * w[u_at(k) + IFX];
+    return plan_inputs.row(0).transpose();
 }
 
 }  // namespace tc

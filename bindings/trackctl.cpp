@@ -9,6 +9,7 @@
 #include "sim/plant/bicycle_plant.hpp"
 #include "sim/plant/chrono_plant.hpp"
 #include "sim/racetrack/driver.hpp"
+#include "sim/racetrack/fallback_control.hpp"
 #include "track_control/nmpc.hpp"
 #include "track_control/pure_pursuit.hpp"
 
@@ -92,7 +93,8 @@ PYBIND11_MODULE(trackctl, m) {
         .def_readwrite("mu_use", &Tuning::mu_use)
         .def_readwrite("brake_use", &Tuning::brake_use)
         .def_readwrite("drive_use", &Tuning::drive_use)
-        .def_readwrite("sideslip_max", &Tuning::sideslip_max);
+        .def_readwrite("sideslip_max", &Tuning::sideslip_max)
+        .def_readwrite("solve_time_limit", &Tuning::solve_time_limit);
     m.def("load_tuning", [](const std::string& dynamics) { return load_tuning(dynamics); },
           "NMPC margins for 'bicycle', 'chrono' or 'carla' from config/tuning.json");
 
@@ -104,8 +106,8 @@ PYBIND11_MODULE(trackctl, m) {
              }),
              py::arg("controller"), py::arg("circuit"), py::arg("params"), py::arg("perception"),
              py::arg("tuning") = Tuning(), "controller: 'nmpc' or 'pure_pursuit'")
-        .def("__call__", &Driver::operator(), py::arg("t"), py::arg("x"),
-             "input [steering rate, Fx] for the true state x at time t")
+        .def("__call__", &Driver::operator(), py::arg("t"), py::arg("x"), py::call_guard<py::gil_scoped_release>(),
+             "input [steering rate, Fx] for the true state x at time t (other Python threads run meanwhile)")
         .def_property_readonly("name", [](Driver& d) { return d.controller().name(); })
         .def_property_readonly("measured_state", [](const Driver& d) { return d.last.x; })
         .def_property_readonly("n_detected", [](const Driver& d) { return d.last.obstacles.size(); })
@@ -157,6 +159,31 @@ PYBIND11_MODULE(trackctl, m) {
             },
             "predicted path of the NMPC as (s, e_y) pairs; empty for pure pursuit");
 
+    py::class_<FallbackControl>(m, "FallbackControl",
+                                "the NMPC with pure pursuit as its fallback, on their own threads against the running "
+                                "bicycle plant (sim/racetrack/fallback_control.hpp)")
+        .def(py::init([](Driver& nmpc, Driver& pure_pursuit, double rate, double deadline) {
+                 return std::make_unique<FallbackControl>(nmpc, pure_pursuit, FallbackControl::Options{rate, deadline});
+             }),
+             py::arg("nmpc"), py::arg("pure_pursuit"), py::arg("rate") = 100.0, py::arg("deadline") = 0.1,
+             py::keep_alive<1, 2>(), py::keep_alive<1, 3>())
+        .def("start", &FallbackControl::start)
+        .def("stop", &FallbackControl::stop, py::call_guard<py::gil_scoped_release>())
+        .def("status",
+             [](const FallbackControl& c) {
+                 const auto s = c.status();
+                 py::dict d;
+                 d["source"] = source_name(s.source), d["reason"] = s.reason, d["plan_age"] = s.plan_age;
+                 d["last_solve"] = s.last_solve, d["last_converged"] = s.last_converged;
+                 d["ticks"] = s.ticks, d["nmpc_ticks"] = s.nmpc_ticks, d["pure_pursuit_ticks"] = s.pure_pursuit_ticks;
+                 d["solves"] = s.solves, d["solves_on_time"] = s.solves_on_time;
+                 d["pure_pursuit_updates"] = s.pure_pursuit_updates;
+                 return d;
+             },
+             "source ('nmpc', 'pure_pursuit' or 'none') of the last command, the reason for pure pursuit, the "
+             "plan's age [s], the last solve's wall time [s] and convergence, and counts")
+        .def_property_readonly("plan", &FallbackControl::plan, "(s, e_y) of the NMPC plan in use; empty if none");
+
     py::class_<PlantModel>(m, "PlantModel")
         .def("reset", &PlantModel::reset)
         .def("observe", &PlantModel::observe)
@@ -164,7 +191,51 @@ PYBIND11_MODULE(trackctl, m) {
         .def("step", &PlantModel::step, py::arg("u"), py::arg("duration"))
         .def("set_friction", &PlantModel::set_friction);
 
-    py::class_<BicyclePlant, PlantModel>(m, "BicyclePlant").def(py::init<const VehicleParams&>());
+    py::class_<BicyclePlant, PlantModel>(m, "BicyclePlant")
+        .def(py::init<const VehicleParams&>())
+        .def(
+            "start",
+            [](BicyclePlant& plant, const Circuit* circuit, double rate, int priority, int cpu) {
+                plant.surface_friction = nullptr;
+                if (circuit)
+                    plant.surface_friction = [circuit](const State& x) {
+                        return circuit->friction(circuit->track_state(x).e_y);
+                    };
+                plant.start(BicyclePlant::Realtime{rate, priority, cpu});
+            },
+            py::arg("circuit") = nullptr, py::arg("rate") = 1000.0, py::arg("priority") = 80, py::arg("cpu") = -1,
+            py::keep_alive<1, 2>(),
+            "step on its own thread at `rate` Hz in real time, through trackctl.bicycle_state; with `circuit`, "
+            "the friction follows the surface under the car")
+        .def("stop", &BicyclePlant::stop, py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly("running", &BicyclePlant::running)
+        .def(
+            "timing",
+            [](const BicyclePlant& plant) {
+                const auto s = plant.timing();
+                py::dict d;
+                d["ticks"] = s.ticks, d["overruns"] = s.overruns, d["latency_mean"] = s.latency_mean;
+                d["latency_max"] = s.latency_max, d["step_max"] = s.step_max, d["realtime"] = s.realtime;
+                return d;
+            },
+            "the thread's timing: ticks, overruns, latency_mean, latency_max, step_max [s], realtime (SCHED_FIFO)");
+
+    py::class_<BicycleBus>(m, "BicycleBus", "the running bicycle plant's state and input (sim/plant/bicycle_plant.hpp)")
+        .def(
+            "state",
+            [](const BicycleBus& bus) {
+                double t;
+                const State x = bus.state(&t);
+                return py::make_tuple(t, x);
+            },
+            "(t, x): plant time and state after its latest tick")
+        .def("command", &BicycleBus::command, py::arg("u"), "input held by the plant from its next tick on")
+        .def_property_readonly("commanded", &BicycleBus::commanded)
+        .def_property_readonly("applied", &BicycleBus::applied_input, "the input after the plant's limits")
+        .def_property(
+            "mu", [](const BicycleBus& bus) { return bus.mu.load(); },
+            [](BicycleBus& bus, double mu) { bus.mu.store(mu); });
+    m.attr("bicycle_state") = py::cast(&bicycle_state, py::return_value_policy::reference);
 
     py::class_<ChronoPlant::Attitude>(m, "Attitude")
         .def_readonly("roll", &ChronoPlant::Attitude::roll)

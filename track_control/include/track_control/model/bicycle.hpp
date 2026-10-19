@@ -2,7 +2,8 @@
 //
 // State and input as in types.hpp. Fx is split between the axles by the drive
 // and brake shares; longitudinal load transfer is quasi-static; the lateral
-// tire forces come from the Fiala model with friction-circle derating.
+// tire forces come from the Fiala model with friction-circle derating, each
+// axle's cornering stiffness following its load if the parameters give a table.
 //
 // The equations are templates on the scalar type: double for simulation,
 // casadi::SX for the NMPC.
@@ -49,8 +50,15 @@ AxleForces<T> axle_forces(const StateOf<T>& x, const InputOf<T>& u, const Vehicl
     T Fzf = (p.m * p.g * p.b - p.h * Fx) / p.L();
     T Fzr = (p.m * p.g * p.a + p.h * Fx) / p.L();
     std::array<T, 2> a = alpha ? *alpha : slip_angles(x, p);
-    T Fyf = fiala_lateral(a[0], Fzf, Fxf, p.C_alpha_f, p.mu_f());
-    T Fyr = fiala_lateral(a[1], Fzr, Fxr, p.C_alpha_r, p.mu_r());
+    // stiffness at the axle loads, the tables' pieces between the loads full brake and full drive give
+    const double Fzf_lo = (p.m * p.g * p.b - p.h * p.F_drive_max) / p.L();
+    const double Fzf_hi = (p.m * p.g * p.b + p.h * p.F_brake_max) / p.L();
+    const double Fzr_lo = (p.m * p.g * p.a - p.h * p.F_brake_max) / p.L();
+    const double Fzr_hi = (p.m * p.g * p.a + p.h * p.F_drive_max) / p.L();
+    T Cf = cornering_stiffness(p.C_alpha_f_load, p.C_alpha_f, Fzf, Fzf_lo, Fzf_hi);
+    T Cr = cornering_stiffness(p.C_alpha_r_load, p.C_alpha_r, Fzr, Fzr_lo, Fzr_hi);
+    T Fyf = fiala_lateral(a[0], Fzf, Fxf, Cf, p.mu_f());
+    T Fyr = fiala_lateral(a[1], Fzr, Fxr, Cr, p.mu_r());
     return {Fzf, Fzr, Fxf, Fxr, Fyf, Fyr, a[0], a[1]};
 }
 
