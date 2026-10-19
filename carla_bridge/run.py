@@ -169,6 +169,16 @@ def write_solves(path, stats):
         w.writerows(stats)
 
 
+def name_os_thread(name):
+    """Give the calling thread `name` where top -H and the like show it (Linux; up to 15 characters)."""
+    try:
+        import ctypes
+
+        ctypes.CDLL(None).prctl(15, name.encode()[:15], 0, 0, 0)  # PR_SET_NAME
+    except (OSError, AttributeError):
+        pass
+
+
 class ViewThread(threading.Thread):
     """Draws the HUD and rate panel on the camera frames and writes them to the video and stream, off the CARLA
     world thread: that thread hands over its latest frame and goes on. A frame the view has no time for is
@@ -190,6 +200,7 @@ class ViewThread(threading.Thread):
             self.ready.notify()
 
     def run(self):
+        name_os_thread("view")
         try:
             while True:
                 with self.ready:
@@ -227,6 +238,7 @@ class ControllerThread(threading.Thread):
         self.error = None
 
     def run(self):
+        name_os_thread("controller")
         try:
             next_time = time.perf_counter()
             while not self.halt.is_set():

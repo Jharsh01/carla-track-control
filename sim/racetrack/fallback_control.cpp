@@ -1,5 +1,7 @@
 #include "sim/racetrack/fallback_control.hpp"
 
+#include <pthread.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -72,6 +74,7 @@ std::vector<std::pair<double, double>> FallbackControl::plan() const {
 }
 
 void FallbackControl::nmpc_loop() {
+    pthread_setname_np(pthread_self(), "nmpc");  // as top -H shows it
     while (running_) {
         double t;
         const State x = bicycle_state.state(&t);
@@ -113,6 +116,7 @@ void FallbackControl::nmpc_loop() {
 }
 
 void FallbackControl::pure_pursuit_loop() {
+    pthread_setname_np(pthread_self(), "pure_pursuit");  // as top -H shows it
     const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / options_.rate));
     Clock::time_point next = Clock::now();
     while (running_) {
@@ -131,6 +135,7 @@ void FallbackControl::pure_pursuit_loop() {
 }
 
 void FallbackControl::command_loop() {
+    pthread_setname_np(pthread_self(), "command");  // as top -H shows it
     const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / options_.rate));
     Clock::time_point next = Clock::now();
     while (running_) {

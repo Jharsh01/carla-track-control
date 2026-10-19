@@ -154,6 +154,7 @@ BicyclePlant::TimingStats BicyclePlant::timing() const {
 
 void BicyclePlant::tick_loop() {
     Runner& r = *runner_;
+    pthread_setname_np(pthread_self(), "plant");  // as top -H shows it
     if (r.options.cpu >= 0) {
         cpu_set_t cpus;
         CPU_ZERO(&cpus);
