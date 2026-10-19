@@ -41,18 +41,24 @@ execute_process(
 find_package(pybind11 CONFIG REQUIRED)
 find_package(casadi CONFIG REQUIRED)
 
+# ---- Project Chrono (optional)
+#
+# Chrono's package sets CMAKE_CXX_FLAGS to the ones it was built with (-march=native among them), so it is
+# looked for before anything is added: the library and the simulation are then compiled alike. Otherwise
+# the library would assume 16-byte-aligned Eigen memory and the simulation 64-byte (AVX-512), and copying
+# a matrix the library allocated crashes there.
+
+find_package(Chrono COMPONENTS Vehicle CONFIG QUIET
+    PATHS $ENV{CHRONO_ROOT}/install/lib/cmake/Chrono ${CMAKE_SOURCE_DIR}/external/chrono/install/lib/cmake/Chrono
+          $ENV{HOME}/opt/chrono/install/lib/cmake/Chrono)
+
 # ---- the library
 
 enable_testing()
 set(TRACK_CONTROL_BUILD_TESTS ON)  # a normal variable overrides the subproject's option() (CMP0077)
 set(TRACK_CONTROL_BUILD_EXAMPLES ON)
 add_subdirectory(track_control)
-
-# ---- Project Chrono (optional)
-
-find_package(Chrono COMPONENTS Vehicle CONFIG QUIET
-    PATHS $ENV{CHRONO_ROOT}/install/lib/cmake/Chrono ${CMAKE_SOURCE_DIR}/external/chrono/install/lib/cmake/Chrono
-          $ENV{HOME}/opt/chrono/install/lib/cmake/Chrono)
+target_compile_definitions(test_model PRIVATE TEST_VEHICLE_FILE="${CMAKE_SOURCE_DIR}/config/vehicles/model3.json")
 
 # ---- the offline simulation: plants, race track, perception
 
@@ -61,6 +67,7 @@ set(SIM_SOURCES
     sim/racetrack/circuit.cpp
     sim/racetrack/perception.cpp
     sim/racetrack/driver.cpp
+    sim/racetrack/fallback_control.cpp
     sim/racetrack/run_lap.cpp)
 if(Chrono_FOUND)
     list(APPEND SIM_SOURCES sim/plant/chrono_plant.cpp)
@@ -68,9 +75,10 @@ else()
     list(APPEND SIM_SOURCES sim/plant/chrono_plant_missing.cpp)
 endif()
 
+find_package(Threads REQUIRED)  # the bicycle plant's real-time thread
 add_library(sim STATIC ${SIM_SOURCES})
 target_include_directories(sim PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(sim PUBLIC track_control::track_control PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(sim PUBLIC track_control::track_control Threads::Threads PRIVATE nlohmann_json::nlohmann_json)
 target_compile_definitions(sim PUBLIC SIM_CONFIG_DIR="${CMAKE_SOURCE_DIR}/config")
 get_target_property(CASADI_LIBRARY casadi::casadi IMPORTED_LOCATION_RELEASE)
 get_filename_component(CASADI_LIB_DIR ${CASADI_LIBRARY} DIRECTORY)
@@ -93,6 +101,11 @@ endif()
 add_executable(simulate sim/simulate.cpp)
 target_link_libraries(simulate PRIVATE sim nlohmann_json::nlohmann_json)
 set_target_properties(simulate PROPERTIES BUILD_RPATH "${RPATH}")
+
+add_executable(test_bicycle_realtime sim/plant/test_bicycle_realtime.cpp)
+target_link_libraries(test_bicycle_realtime PRIVATE sim)
+set_target_properties(test_bicycle_realtime PROPERTIES BUILD_RPATH "${RPATH}")
+add_test(NAME sim.test_bicycle_realtime COMMAND test_bicycle_realtime)
 
 if(Chrono_FOUND)
     add_executable(identify_chrono sim/plant/identify_chrono.cpp)

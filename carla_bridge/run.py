@@ -11,6 +11,17 @@ a HUD), .csv (one row per step), .json (the result, as build/simulate
 writes offline) and, for the NMPC, _solves.csv (one row per solve: timing
 breakdown, iterations, status, slacks). The CARLA server must be running (scripts/start_carla.sh;
 run.sh starts it).
+
+With --dynamics bicycle, three threads run side by side in real time: the plant
+at 1 kHz (C++, timer-driven), the controller at --control-rate (100 Hz), and the
+CARLA world (draw, camera, log) at --world-rate (25 Hz). With --controller nmpc_fallback the
+controller is three threads (C++, sim/racetrack/fallback_control.hpp): the NMPC
+solving back to back, pure pursuit at --control-rate, and the command thread
+sending the NMPC's planned input while the NMPC is on time (converged within
+--nmpc-deadline) and pure pursuit's otherwise; the HUD says which. They share the state and the input through the
+global trackctl.bicycle_state, each taking the latest value: nothing waits for
+an NMPC solve, so a slow solve leaves the car on its last input. --lockstep
+runs them one after the other instead, as the other dynamics do.
 """
 import argparse
 import csv
@@ -18,6 +29,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,7 +49,13 @@ SOLVE_COLUMNS = ["t", "s0", "ux0", "t_wall", "t_total", "t_proc", "t_hess", "t_j
 def parse(argv=None):
     p = argparse.ArgumentParser(prog="python -m carla_bridge", description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--controller", choices=["nmpc", "pure_pursuit", "both"], default="both")
+    p.add_argument("--controller", choices=["nmpc", "pure_pursuit", "both", "nmpc_fallback"], default="both",
+                   help="nmpc_fallback (threaded bicycle only): the NMPC and pure pursuit both running, pure pursuit's "
+                        "input commanded whenever the NMPC is not on time")
+    p.add_argument("--control-rate", type=float, default=100.0,
+                   help="threaded: rate at which an input is commanded [Hz] (pure pursuit computes at it too)")
+    p.add_argument("--nmpc-deadline", type=float, default=0.1,
+                   help="nmpc_fallback: wall time an NMPC solve may take [s]; later or not converged: pure pursuit")
     p.add_argument("--dynamics", choices=["carla", "chrono", "bicycle"], default="carla",
                    help="who simulates the ego car: CARLA's vehicle physics, the Project Chrono sedan or the "
                         "controllers' own bicycle model (the offline plant)")
@@ -57,6 +75,13 @@ def parse(argv=None):
     p.add_argument("--no-rates", action="store_true",
                    help="no side panel plotting the controller's and the plant's average rate in wall-clock Hz")
     p.add_argument("--no-plan", action="store_true", help="do not draw the NMPC's predicted path in the world")
+    p.add_argument("--lockstep", action="store_true",
+                   help="with --dynamics bicycle: one loop, controller then plant then CARLA tick, CARLA waiting "
+                        "for each (the other dynamics always run so); default: plant (1 kHz), controller and "
+                        "CARLA world on their own threads in real time")
+    p.add_argument("--plant-rate", type=float, default=1000.0, help="the threaded bicycle plant's rate [Hz]")
+    p.add_argument("--world-rate", type=float, default=25.0,
+                   help="threaded: rate of the CARLA world thread [Hz]: ticks, camera frames, video, log")
     p.add_argument("--no-scenery", action="store_true",
                    help="CARLA's plain generated road instead of asphalt, kerbs, grass, barriers and trees")
     return p.parse_args(argv)
@@ -144,6 +169,85 @@ def write_solves(path, stats):
         w.writerows(stats)
 
 
+class ViewThread(threading.Thread):
+    """Draws the HUD and rate panel on the camera frames and writes them to the video and stream, off the CARLA
+    world thread: that thread hands over its latest frame and goes on. A frame the view has no time for is
+    skipped, and the video repeats the last one drawn in its place, so the video keeps real-time pace."""
+
+    def __init__(self, compose, publish):
+        super().__init__(name="view", daemon=True)
+        self.compose, self.publish = compose, publish
+        self.ready = threading.Condition()
+        self.latest = None  # (world tick, compose arguments)
+        self.closing = False
+        self.written = 0  # world ticks the video has frames for
+        self.drawn = 0  # frames composed
+        self.error = None
+
+    def submit(self, tick, item):
+        with self.ready:
+            self.latest = (tick, item)
+            self.ready.notify()
+
+    def run(self):
+        try:
+            while True:
+                with self.ready:
+                    self.ready.wait_for(lambda: self.latest is not None or self.closing)
+                    if self.latest is None:
+                        return
+                    (tick, item), self.latest = self.latest, None
+                rgb = self.compose(*item)
+                self.drawn += 1
+                self.publish(rgb, frames=tick - self.written)
+                self.written = tick
+        except Exception as error:  # noqa: BLE001 - handed to the world thread, which stops the run
+            self.error = error
+
+    def finish(self):
+        """Draw the last frame handed over, then stop."""
+        with self.ready:
+            self.closing = True
+            self.ready.notify()
+        self.join()
+
+
+class ControllerThread(threading.Thread):
+    """The controller on its own thread: every `period` seconds of wall time (at once after a solve that took
+    longer) it reads the plant's latest state from trackctl.bicycle_state, solves, and commands the input
+    there. The solve releases the GIL, so the CARLA thread runs meanwhile."""
+
+    def __init__(self, driver, period, keep_plan):
+        super().__init__(name="controller", daemon=True)
+        self.driver, self.period, self.keep_plan = driver, period, keep_plan
+        self.halt = threading.Event()
+        self.solves = 0  # completed
+        self.last_solve = None  # [s]
+        self.plan = []  # the NMPC's latest predicted path, copied here so the CARLA thread can draw it
+        self.error = None
+
+    def run(self):
+        try:
+            next_time = time.perf_counter()
+            while not self.halt.is_set():
+                t, x = trackctl.bicycle_state.state()
+                start = time.perf_counter()
+                u = self.driver(t, x)
+                self.last_solve = time.perf_counter() - start
+                trackctl.bicycle_state.command(u)
+                if self.keep_plan:
+                    self.plan = self.driver.plan
+                self.solves += 1
+                next_time = max(next_time + self.period, time.perf_counter())
+                self.halt.wait(next_time - time.perf_counter())
+        except Exception as error:  # noqa: BLE001 - handed to the CARLA thread, which stops the run
+            self.error = error
+
+    def stop(self):
+        self.halt.set()
+        self.join()
+
+
 def drive(args, client, circuit, controller, stream=None):
     import carla
 
@@ -154,14 +258,28 @@ def drive(args, client, circuit, controller, stream=None):
         args.params or os.path.join(trackctl.config_dir, "vehicles", VEHICLE_FILES[dynamics_name]))
     perception = (trackctl.Perception.exact(circuit) if args.perfect else
                   trackctl.Perception.noisy(circuit, road_range=args.road_range, seed=args.seed))
-    driver = trackctl.Driver(controller, circuit, params, perception, trackctl.load_tuning(dynamics_name))
+    tuning = trackctl.load_tuning(dynamics_name)
+    fallback_driver = None
+    if controller == "nmpc_fallback":
+        if dynamics_name != "bicycle" or args.lockstep:
+            raise SystemExit("--controller nmpc_fallback needs --dynamics bicycle without --lockstep")
+        tuning.solve_time_limit = args.nmpc_deadline
+        driver = trackctl.Driver("nmpc", circuit, params, perception, tuning)
+        fallback_perception = (trackctl.Perception.exact(circuit) if args.perfect else
+                               trackctl.Perception.noisy(circuit, road_range=args.road_range, seed=args.seed))
+        fallback_driver = trackctl.Driver("pure_pursuit", circuit, params, fallback_perception)
+    else:
+        driver = trackctl.Driver(controller, circuit, params, perception, tuning)
 
-    world, original_settings = cw.build_world(client, circuit, args.dt, scenery=not args.no_scenery)
+    threaded = dynamics_name == "bicycle" and not args.lockstep
+    world_dt = 1.0 / args.world_rate if threaded else args.dt  # one world tick (and camera frame)
+    world, original_settings = cw.build_world(client, circuit, world_dt, scenery=not args.no_scenery)
     actors = []
     try:
         traffic = cw.Traffic(world, circuit)
         actors.append(traffic)
-        dynamics = cw.DYNAMICS[dynamics_name](world, circuit, params, args.dt)
+        dynamics = (cw.ThreadedBicycleDynamics if threaded else cw.DYNAMICS[dynamics_name])(
+            world, circuit, params, world_dt)
         actors.append(dynamics)
         traffic.place(0.0)
         camera = video = hud = rates = None
@@ -171,66 +289,82 @@ def drive(args, client, circuit, controller, stream=None):
             actors.append(camera)
             hud = view.Hud(circuit)
             if not args.no_rates:
-                rates = view.RatePanel(args.dt)
+                if fallback_driver:
+                    rates = view.RatePanel(world_dt, series=view.RatePanel.FALLBACK, real_time={
+                        "command": args.control_rate, "nmpc": 1.0 / args.nmpc_deadline,
+                        "pure_pursuit": args.control_rate, "plant": args.plant_rate})
+                elif threaded:
+                    rates = view.RatePanel(world_dt, series=view.RatePanel.THREADS,
+                                           real_time={"controller": args.control_rate, "plant": args.plant_rate})
+                else:
+                    rates = view.RatePanel(args.dt)
                 width += view.RatePanel.WIDTH
         os.makedirs(args.out, exist_ok=True)
         stem = os.path.join(args.out, "%s_%s" % (controller, dynamics_name))
         if not args.no_video:
-            video = view.Video(stem + ".mp4", (width, 720), fps=round(1.0 / args.dt))
+            video = view.Video(stem + ".mp4", (width, 720), fps=round(1.0 / world_dt))
 
         def friction(x):
             return circuit.friction(circuit.track_state(np.asarray(x))[1])
 
-        t = 0.0
-        x = np.asarray(dynamics.state())
-        run = Run(circuit, x)
         spectator = world.get_spectator()
-        wall = time.time()
-        print("driving %d lap(s) with %s on %s dynamics ..." % (args.laps, controller, dynamics_name))
-        while t < args.t_max:
-            start = time.perf_counter()
-            u = np.asarray(driver(t, x))
-            controller_time = time.perf_counter() - start
-            e_y = run.update(t, x, u, args.dt, args.laps)
-            if run.done:
-                break
-            start = time.perf_counter()
-            dynamics.apply(u, x, friction)
-            plant_time = time.perf_counter() - start
-            traffic.place(t + args.dt)
-            if not args.no_plan and controller == "nmpc":
-                draw_plan(world, circuit, driver.plan, args.dt)
-            start = time.perf_counter()
-            frame = world.tick()
-            dynamics.after_tick()
-            plant_time += time.perf_counter() - start
-            t += args.dt
-            if rates:
-                rates.add(t, controller_time, plant_time)
-            x = np.asarray(dynamics.state())
-            # the spectator (what a CARLA window would show) follows the car too
+
+        def capture(frame):
+            """The spectator (what a CARLA window would show) behind the car; the camera's image of `frame`."""
             ego = dynamics.actor.get_transform()
             spectator.set_transform(carla.Transform(ego.transform(carla.Location(x=-12.0, z=6.0)),
                                                     carla.Rotation(pitch=-20.0, yaw=ego.rotation.yaw)))
-            if camera:
-                rgb = camera.read(frame)
-                lines = view.hud_lines(controller, dynamics_name, t, x, e_y, run.progress,
-                                       args.laps * circuit.track.length, driver.last_solve_time)
-                traffic_xy = [(p.x, p.y) for p in (circuit.traffic_pose(i, t) for i in range(circuit.n_traffic))]
-                rgb = hud.draw(rgb, lines, (x[0], x[1]), traffic_xy)
-                if rates:
-                    rgb = rates.draw(rgb)
-                if video:
+            return camera.read(frame) if camera else None
+
+        def compose(rgb, t, x, e_y, progress, solve_time, banner=None):
+            """The camera image with the HUD and the rate panel."""
+            lines = view.hud_lines(controller, dynamics_name, t, x, e_y, progress,
+                                   args.laps * circuit.track.length, solve_time)
+            traffic_xy = [(p.x, p.y) for p in (circuit.traffic_pose(i, t) for i in range(circuit.n_traffic))]
+            rgb = hud.draw(rgb, lines, (x[0], x[1]), traffic_xy, banner)
+            return rates.draw(rgb) if rates else rgb
+
+        def publish(rgb, frames=1):
+            """A composed image to the video (as `frames` frames) and the live stream."""
+            if video:
+                for _ in range(frames):
                     video.add(rgb)
-                if stream:
-                    stream.add(rgb)
+            if stream:
+                stream.add(rgb)
+
+        def show(frame, t, x, e_y, progress, solve_time):
+            """Lockstep: capture, compose and publish in this thread."""
+            rgb = capture(frame)
+            if rgb is not None:
+                publish(compose(rgb, t, x, e_y, progress, solve_time))
+
+        run = Run(circuit, np.asarray(dynamics.state()))
+        wall = time.time()
+        print("driving %d lap(s) with %s on %s dynamics%s ..." % (
+            args.laps, controller, dynamics_name, " (threads: plant %.0f Hz, controller %.0f Hz, world %.0f Hz)" % (
+                args.plant_rate, args.control_rate, 1.0 / world_dt) if threaded else ""))
+        extra = {}
+        if threaded:
+            viewer = ViewThread(compose, publish) if camera else None
+            if viewer:
+                viewer.start()
+            try:
+                extra = run_threads(args, world, circuit, controller, driver, dynamics, traffic, run, rates, capture,
+                                    viewer, fallback_driver, world_dt)
+            finally:
+                if viewer:
+                    viewer.finish()
+        else:
+            run_lockstep(args, world, circuit, controller, driver, dynamics, traffic, run, rates, show, friction)
         if video:
             video.close()
 
         result = run.summary(controller, dynamics_name, driver, args.dt)
+        result.update(extra)
         with open(stem + ".csv", "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["t", "X", "Y", "psi", "Ux", "Uy", "r", "delta", "delta_rate", "Fx", "s", "e_y", "mu"])
+            w.writerow(["t", "X", "Y", "psi", "Ux", "Uy", "r", "delta", "delta_rate", "Fx", "s", "e_y", "mu"] +
+                       (["command"] if fallback_driver else []))
             w.writerows(run.rows)
         stats = getattr(driver, "solve_stats", [])
         if stats:
@@ -248,6 +382,128 @@ def drive(args, client, circuit, controller, stream=None):
             except RuntimeError:
                 pass
         world.apply_settings(original_settings)
+
+
+def run_lockstep(args, world, circuit, controller, driver, dynamics, traffic, run, rates, show, friction):
+    """One loop: the controller, then the plant through the world step, then CARLA's tick; CARLA waits for both."""
+    t = 0.0
+    x = np.asarray(dynamics.state())
+    while t < args.t_max:
+        start = time.perf_counter()
+        u = np.asarray(driver(t, x))
+        controller_time = time.perf_counter() - start
+        e_y = run.update(t, x, u, args.dt, args.laps)
+        if run.done:
+            break
+        start = time.perf_counter()
+        dynamics.apply(u, x, friction)
+        plant_time = time.perf_counter() - start
+        traffic.place(t + args.dt)
+        if not args.no_plan and controller == "nmpc":
+            draw_plan(world, circuit, driver.plan, args.dt)
+        start = time.perf_counter()
+        frame = world.tick()
+        dynamics.after_tick()
+        plant_time += time.perf_counter() - start
+        t += args.dt
+        if rates:
+            rates.add(t, controller_time, plant_time)
+        x = np.asarray(dynamics.state())
+        show(frame, t, x, e_y, run.progress, driver.last_solve_time)
+
+
+def run_threads(args, world, circuit, controller, driver, dynamics, traffic, run, rates, capture, viewer,
+                fallback_driver=None, world_dt=0.04):
+    """The plant (its own C++ thread), the controller (a Python thread; or, with `fallback_driver`, the NMPC, pure
+    pursuit and the command thread in C++) and the CARLA world (this thread), each at its own rate in real time,
+    sharing the state and input through trackctl.bicycle_state. This thread ticks CARLA every `world_dt` of wall time
+    with the car where the plant has it, reads the camera, logs and ends the run; `viewer` (a ViewThread) draws the
+    HUD and panel and writes the video and stream, so drawing never slows the world. Returns what goes into the result besides Run's summary."""
+    from . import view
+
+    x0 = np.asarray(dynamics.state())
+    u0 = np.asarray(driver(0.0, x0))  # the first solve (the NMPC's is slow) before the clocks start
+    keep_plan = not args.no_plan and controller in ("nmpc", "nmpc_fallback")
+    if fallback_driver:
+        u0 = np.asarray(fallback_driver(0.0, x0))  # the NMPC's cold solve may not have made the deadline
+        control = trackctl.FallbackControl(driver, fallback_driver, rate=args.control_rate, deadline=args.nmpc_deadline)
+    else:
+        control = ControllerThread(driver, 1.0 / args.control_rate, keep_plan)
+    dynamics.start(u0, rate=args.plant_rate)
+    control.start()
+    start = time.perf_counter()
+    next_time = start
+    ticks = 0
+    t_prev = 0.0
+    status = None
+    try:
+        while True:
+            t, x = dynamics.sample()
+            x = np.asarray(x)
+            if not fallback_driver and control.error:
+                raise control.error
+            u = np.asarray(trackctl.bicycle_state.applied)
+            e_y = run.update(t, x, u, t - t_prev, args.laps)
+            t_prev = t
+            banner = None
+            if fallback_driver:
+                status = control.status()
+                run.rows[-1].append(status["source"])
+                plan, solve_time = control.plan, status["last_solve"] or None
+                banner = view.command_banner(status, args.nmpc_deadline)
+            else:
+                plan, solve_time = control.plan, control.last_solve
+            if run.done or t >= args.t_max:
+                break
+            dynamics.after_tick()  # the car where the plant has it now
+            traffic.place(t)
+            if keep_plan and plan:
+                draw_plan(world, circuit, plan, world_dt)
+            frame = world.tick()
+            ticks += 1
+            if rates:
+                wall = time.perf_counter() - start
+                plant_ticks = dynamics.plant.timing()["ticks"]
+                if fallback_driver:
+                    rates.add_counts(t, {"command": (status["ticks"], wall), "nmpc": (status["solves"], wall),
+                                         "pure_pursuit": (status["pure_pursuit_updates"], wall),
+                                         "plant": (plant_ticks, wall), "world": (ticks, wall)})
+                else:
+                    rates.add_counts(t, {"controller": (control.solves, wall), "plant": (plant_ticks, wall),
+                                         "world": (ticks, wall)})
+            rgb = capture(frame)
+            if viewer and rgb is not None:
+                if viewer.error:
+                    raise viewer.error
+                viewer.submit(ticks, (rgb, t, x, e_y, run.progress, solve_time, banner))
+            next_time = max(next_time + world_dt, time.perf_counter())
+            time.sleep(max(0.0, next_time - time.perf_counter()))
+    finally:
+        control.stop()
+        dynamics.stop()
+    wall = time.perf_counter() - start
+    timing = dynamics.plant.timing()
+    if fallback_driver:
+        status = control.status()
+        commands = "command %.1f Hz (NMPC %d, pure pursuit %d), NMPC %.1f solves/s (%d of %d on time), " \
+                   "pure pursuit %.1f Hz" % (status["ticks"] / wall, status["nmpc_ticks"], status["pure_pursuit_ticks"],
+                                            status["solves"] / wall, status["solves_on_time"], status["solves"],
+                                            status["pure_pursuit_updates"] / wall)
+    else:
+        commands = "controller %.1f Hz" % (control.solves / wall)
+    drawn = ", view %.1f Hz (%d of %d frames drawn, the others repeated in the video)" % (
+        viewer.drawn / wall, viewer.drawn, ticks) if viewer else ""
+    print("threads over %.1f s: plant %.1f Hz (%d overruns, wake-up latency mean %.0f us, max %.0f us, %s), "
+          "%s, CARLA world %.1f Hz%s" % (
+              wall, timing["ticks"] / wall, timing["overruns"], 1e6 * timing["latency_mean"],
+              1e6 * timing["latency_max"], "SCHED_FIFO" if timing["realtime"] else "normal priority",
+              commands, ticks / wall, drawn))
+    if not fallback_driver:
+        return {}
+    ticks_total = max(1, status["ticks"])
+    return {"nmpc_command_share": status["nmpc_ticks"] / ticks_total, "nmpc_solves": status["solves"],
+            "nmpc_solves_on_time": status["solves_on_time"], "nmpc_deadline": args.nmpc_deadline,
+            "control_rate": args.control_rate}
 
 
 def draw_plan(world, circuit, plan, dt):

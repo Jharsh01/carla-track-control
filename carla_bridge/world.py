@@ -16,6 +16,11 @@ off and are placed every tick where the scenario says they are.
 The world runs in synchronous mode at a fixed step, so CARLA waits for the
 controllers; an NMPC solve that takes longer than a step slows the simulation,
 it does not change it.
+
+Except with the threaded bicycle plant (ThreadedBicycleDynamics, the default
+for --dynamics bicycle): there the plant, the controller and the CARLA world
+each run on their own thread in real time, sharing the state and input through
+trackctl.bicycle_state; CARLA's ticks only draw, at the world thread's own rate.
 """
 import math
 
@@ -249,6 +254,42 @@ class BicycleDynamics(ChronoDynamics):
     def _pose(self):
         X0, Y0, psi = self._origin(self.plant.observe())
         self.actor.set_transform(transform(X0, Y0, psi, z=self.z))
+
+
+class ThreadedBicycleDynamics(BicycleDynamics):
+    """The bicycle plant on its own thread, stepping at 1 kHz in real time (trackctl.BicyclePlant.start),
+    the friction following the surface under it. Its state and input are the globals
+    trackctl.bicycle_state: the controller thread commands the input there and CARLA draws the latest
+    state; neither waits for the other or for the plant."""
+
+    def start(self, u0, rate=1000.0):
+        import trackctl
+
+        trackctl.bicycle_state.command(u0)
+        self.plant.start(circuit=self.circuit, rate=rate)
+
+    def sample(self):
+        """(t, x): plant time and state after the plant's latest tick."""
+        import trackctl
+
+        return trackctl.bicycle_state.state()
+
+    def state(self):
+        return self.sample()[1] if self.plant.running else self.plant.observe()
+
+    def apply(self, u, x, friction):
+        raise RuntimeError("the threaded plant takes its input from trackctl.bicycle_state")
+
+    def _pose(self):
+        X0, Y0, psi = self._origin(self.state())
+        self.actor.set_transform(transform(X0, Y0, psi, z=self.z))
+
+    def stop(self):
+        self.plant.stop()
+
+    def destroy(self):
+        self.plant.stop()
+        super().destroy()
 
 
 DYNAMICS = {"carla": CarlaDynamics, "chrono": ChronoDynamics, "bicycle": BicycleDynamics}

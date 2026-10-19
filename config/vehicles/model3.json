@@ -92,13 +92,65 @@
         "value": 106500.0,
         "unit": "N/rad",
         "source": "derived",
-        "description": "front axle cornering stiffness (both tires)"
+        "description": "front axle cornering stiffness (both tires); value at the static load, the model uses load_table: stiffness against axle normal load [N], PhysX's per-tire curve rest load x lat_stiff_value x s(load / rest load / lat_stiff_max_load), s(x) = 1.5x - 0.5x^3, flat from 3x the rest load (docs/vehicle_parameters.md)",
+        "load_table": {
+          "Fz": [
+            2765.5,
+            5531.1,
+            8296.6,
+            11062.1,
+            13827.6,
+            16593.2,
+            19358.7,
+            22124.2,
+            27655.3,
+            33186.3
+          ],
+          "C_alpha": [
+            27591.3,
+            54798.4,
+            81237.4,
+            106524.1,
+            130274.3,
+            152104.1,
+            171629.2,
+            188465.6,
+            212536.0,
+            221242.3
+          ]
+        }
       },
       "C_alpha_r": {
         "value": 67800.0,
         "unit": "N/rad",
         "source": "derived",
-        "description": "rear axle cornering stiffness (both tires)"
+        "description": "rear axle cornering stiffness (both tires); value at the static load, the model uses load_table: stiffness against axle normal load [N], PhysX's per-tire curve rest load x lat_stiff_value x s(load / rest load / lat_stiff_max_load), s(x) = 1.5x - 0.5x^3, flat from 3x the rest load (docs/vehicle_parameters.md)",
+        "load_table": {
+          "Fz": [
+            1759.3,
+            3518.7,
+            5278.0,
+            7037.3,
+            8796.7,
+            10556.0,
+            12315.3,
+            14074.7,
+            17593.3,
+            21112.0
+          ],
+          "C_alpha": [
+            17552.6,
+            34860.9,
+            51680.4,
+            67766.9,
+            82876.0,
+            96763.4,
+            109184.6,
+            119895.4,
+            135208.1,
+            140746.7
+          ]
+        }
       },
       "mu": {
         "value": 0.9,
