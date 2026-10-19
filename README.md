@@ -152,7 +152,10 @@ makes it (IPOPT gets about 9 of the 13 iterations it needs in 100 ms with everyt
 running), so pure pursuit drives and laps cleanly. With 200 ms the NMPC sends about half the
 commands, but handing over between the two in the middle of a manoeuvre (different lines, pure
 pursuit braking hard in a turn) has spun the car in 2 of 3 runs. How all of this was built and
-measured: [`docs/realtime_control_report.md`](docs/realtime_control_report.md).
+measured: [`docs/realtime_control_report.md`](docs/realtime_control_report.md). Where the NMPC's
+solve time goes and how to bring it under 50 ms without changing the lap (FATROP, compiled
+functions, a warm-started barrier: 105 → 19 ms offline):
+[`docs/nmpc_solve_time.pdf`](docs/nmpc_solve_time.pdf).
 
 The controllers see the same thing in every case: the state at the centre of gravity in a
 right-handed frame (`carla_bridge/frames.py` converts from CARLA's left-handed one) and the other
