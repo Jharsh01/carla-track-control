@@ -85,8 +85,12 @@ ssh -L 8080:localhost:8080 <instance>      # on your laptop
 | `--laps N`, `--t-max S` | |
 | `--stream PORT`, `--no-video` | live view; no camera at all (fastest) |
 | `--no-rates` | no side panel plotting the controller's and the plant's rate in wall-clock Hz (and the CARLA world's, threaded) |
-| `--controller nmpc_fallback` | with `--dynamics bicycle`: the NMPC and pure pursuit both running, pure pursuit's input sent whenever the NMPC is late (below) |
-| `--control-rate HZ`, `--nmpc-deadline S` | threaded: how often an input is sent (default 100 Hz); how long an NMPC solve may take (default 0.1 s) |
+| `--no-inputs` | no side panel plotting the controller's inputs, acceleration and steering rate (with `nmpc_fallback`, the NMPC's and pure pursuit's both, and whose the plant got) |
+| `--controller nmpc_fallback` | with `--dynamics bicycle`: the NMPC and pure pursuit both running, the input blended to pure pursuit's whenever the NMPC has no plan for the moment (below) |
+| `--control-rate HZ` | threaded: how often an input is sent (default 50 Hz with `nmpc_fallback`, otherwise 100 Hz) |
+| `--nmpc-period S`, `--blend S` | `nmpc_fallback`: an NMPC solve every S seconds, each plan played for one period (default 0.2 s: 10 commands at 50 Hz); how long a handover between the two controllers takes (default 0.2 s, 0 for a switch) |
+| `--nmpc-dt S`, `--nmpc-horizon S` | the NMPC's step and how far it plans (defaults 0.1 s and 4 s; 2 s with `nmpc_fallback`; `build/simulate` takes the same) |
+| `--nmpc-fine-dt S`, `--nmpc-fine S` | a finer NMPC step for the start of the horizon (default with `nmpc_fallback`: one command, 20 ms, for one period, 0.2 s; otherwise none) |
 | `--lockstep` | with `--dynamics bicycle`: one loop (controller, plant, CARLA tick) instead of three threads |
 | `--plant-rate HZ`, `--world-rate HZ` | the threaded bicycle plant's rate (default 1000); the CARLA world thread's: ticks, camera frames, video (default 25) |
 | `--no-scenery` | CARLA's plain generated road instead of the drawn circuit |
@@ -139,19 +143,38 @@ the same in both; the NMPC, whose solves take about 100 ms and which does not ye
 that delay, does not keep the car on the track in real time.
 
 `--controller nmpc_fallback` runs both controllers at once (`sim/racetrack/fallback_control.hpp`,
-all in C++): the NMPC solving back to back, each solve given `--nmpc-deadline` and planning from
-where the car will be when that time is up (predicted with the bicycle model), pure pursuit every
-10 ms, and a command thread that every 10 ms sends the NMPC's planned input for that moment while
-its solves converge within the deadline, and pure pursuit's latest input otherwise. An input goes
-out every 10 ms whatever the NMPC does. The HUD's banner says whose it is (green NMPC with the
-plan's age, orange pure pursuit with the reason), the rate panel shows all five threads, the
-`.csv` has a `command` column and the `.json` the NMPC's share of the commands.
+all in C++): the NMPC solving every `--nmpc-period` (200 ms), each solve planning from where the car
+will be when that period is up (predicted with the bicycle model and the inputs the current plan
+sends meanwhile), pure pursuit every 20 ms, and a command thread that every 20 ms sends the NMPC's
+planned input for that moment, 10 of them per plan, until the next plan takes over. The plan's
+steps match: 20 ms for the 0.2 s that is played, 0.1 s after that, out to a 2 s horizon (28 steps). A solve that
+runs past its period is not dropped: pure pursuit is blended in until it arrives, then its plan takes
+over from the input it planned for that moment and the next solve starts at once. A handover either
+way is a ramp over `--blend` (200 ms) rather than a switch: the command is
+(1 - w) u_NMPC + w u_pure_pursuit, w moving to 1 while the NMPC has no plan for the moment and back
+to 0 once it has, the NMPC's part meanwhile its last plan carried on past its period. An input goes
+out every 20 ms whatever the NMPC does. The HUD's banner says whose it is (green NMPC with the
+plan's age, orange pure pursuit with the reason, yellow a blend with each one's share), the input
+panel plots both controllers' inputs and the one sent, the rate panel shows all five threads, the
+`.csv` has a `command` column and the `.json` the NMPC's and the blends' shares of the commands.
 
 Measured against the stand-in CARLA on an 8-core VM: with the 100 ms deadline almost no solve
-makes it (IPOPT gets about 9 of the 13 iterations it needs in 100 ms with everything else
-running), so pure pursuit drives and laps cleanly. With 200 ms the NMPC sends about half the
+made it with IPOPT (about 9 of the 13 iterations it needed in 100 ms with everything else
+running), so pure pursuit drove and lapped cleanly. The NMPC now solves with FATROP from a
+time-shifted warm start at tolerance 1e-3: offline, p50 58 ms and p95 75 ms against IPOPT's 99 and
+138 ms, the same lap (72.2 s against 72.3 s). With 200 ms the NMPC sends about half the
 commands, but handing over between the two in the middle of a manoeuvre (different lines, pure
-pursuit braking hard in a turn) has spun the car in 2 of 3 runs. How all of this was built and
+pursuit braking hard in a turn) has spun the car in 2 of 3 runs. With the 200 ms period and the
+blended handover (CARLA server, default sensing), the NMPC drives 98% of the commands and the
+hairpin handover no longer spins it, but the plan, now up to 400 ms old at the end of its period,
+let the car weave while passing on the straight at s 510-590 m: 1 of 2 laps left the track there and
+the other touched the edge (72.8 s); with `--nmpc-period 0.1 --control-rate 100` the lap was clean
+(72.4 s, asphalt margin 0.17 m). With those 20 ms steps for the played 0.2 s and the 2 s horizon, the
+solve takes p50 51 ms, p95 about 80 ms, all 361 of a lap within the 200 ms period, and both laps run
+were clean of the weaving (72.0 s), though with the sideslip briefly past its 7° limit in most corners
+(up to 8.7°) and the body 0.07 m over the asphalt's edge at s 638 m. The 2 s horizon makes the
+NMPC oscillate on the straights; why, and the open work on it and on pure pursuit:
+[`docs/todo.md`](docs/todo.md). How all of this was built and
 measured: [`docs/realtime_control_report.md`](docs/realtime_control_report.md). Where the NMPC's
 solve time goes and how to bring it under 50 ms without changing the lap (FATROP, compiled
 functions, a warm-started barrier: 105 → 19 ms offline):
@@ -187,20 +210,21 @@ It has one row per solve, with these columns:
 |---|---|
 | `t`, `s0`, `ux0` | time [s], path position [m] and measured speed [m/s] at the solve |
 | `t_wall` | wall time around the solver call [s] (what `solve_mean` averages) |
-| `t_total`, `t_proc` | IPOPT's own wall and CPU time [s] |
+| `t_total`, `t_proc` | the solver's wall and CPU time [s] (IPOPT's own timers; for FATROP, measured around the call) |
 | `t_hess`, `t_jac`, `t_grad`, `t_f`, `t_g` | time in the Lagrangian Hessian, constraint Jacobian, cost gradient, cost and constraints [s] |
-| `iterations`, `success`, `status` | IPOPT iterations, convergence and return status |
-| `warm` | started from the previous solution |
+| `iterations`, `success`, `status` | solver iterations, convergence and return status |
+| `warm` | started from the previous solution, shifted to this solve's time |
 | `n_obstacles` | detected cars in the problem |
 | `obj` | final cost |
 | `slack_obstacle`, `slack_edge`, `slack_sideslip`, `slack_speed` | largest slack of each soft constraint over the horizon |
-| `x0_gap` | distance between the initial guess's first state and the measured one |
+| `x0_gap` | distance between the shifted previous plan's first state and the measured one |
+| `directive` | a supervisor's directive (track_control/README.md) was in force |
 
 The result `.json` adds these keys next to `solve_mean`/`solve_max`/`not_converged`:
 - `solve_p50` and `solve_p95`
 - `overrun_fraction`: the share of solves longer than the control period
 - `iter_mean` and `iter_max`
-- `time_share`: hess, jac, grad, f, g and `ipopt_internal` (linear solves and the rest) as fractions of IPOPT's time
+- `time_share`: hess, jac, grad, f, g and `ipopt_internal` (the solver's own work: linear solves and the rest, whichever solver) as fractions of the solver's time
 - `proc_over_wall`: CPU over wall time. Well below 1 means the solver was waiting for a CPU; above 1 means threaded linear algebra.
 - `status_counts`
 - `first_solve`: the cold start

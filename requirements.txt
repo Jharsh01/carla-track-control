@@ -1,6 +1,6 @@
 # Python 3.8 (the CARLA 0.9.15 client exists only for 3.7 and 3.8). setup.sh installs these into .venv.
 carla==0.9.15
-casadi>=3.6,<3.8  # also the C++ library and IPOPT the NMPC links against
+casadi>=3.6,<3.8  # also the C++ library, FATROP and IPOPT the NMPC links against
 pybind11>=2.11
 numpy>=1.20
 pillow>=9

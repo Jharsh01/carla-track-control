@@ -6,6 +6,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <optional>
+
 #include "sim/plant/bicycle_plant.hpp"
 #include "sim/plant/chrono_plant.hpp"
 #include "sim/racetrack/driver.hpp"
@@ -15,6 +17,22 @@
 
 namespace py = pybind11;
 using namespace sim;
+
+namespace {
+
+NMPC& nmpc_of(Driver& d) {
+    auto* nmpc = dynamic_cast<NMPC*>(&d.controller());
+    if (!nmpc) throw std::invalid_argument("directives are for the NMPC, not " + d.controller().name());
+    return *nmpc;
+}
+
+py::dict ranges(const std::map<std::string, NMPC::Range>& rs) {
+    py::dict out;
+    for (const auto& [name, r] : rs) out[py::str(name)] = py::make_tuple(r.lo, r.hi, r.def);
+    return out;
+}
+
+}  // namespace
 
 PYBIND11_MODULE(trackctl, m) {
     m.doc() = "track_control controllers, the race track and the plants (bicycle, Project Chrono)";
@@ -94,9 +112,34 @@ PYBIND11_MODULE(trackctl, m) {
         .def_readwrite("brake_use", &Tuning::brake_use)
         .def_readwrite("drive_use", &Tuning::drive_use)
         .def_readwrite("sideslip_max", &Tuning::sideslip_max)
-        .def_readwrite("solve_time_limit", &Tuning::solve_time_limit);
+        .def_readwrite("solve_time_limit", &Tuning::solve_time_limit)
+        .def_readwrite("nmpc_dt", &Tuning::nmpc_dt)
+        .def_readwrite("nmpc_horizon", &Tuning::nmpc_horizon)
+        .def_readwrite("nmpc_fine_dt", &Tuning::nmpc_fine_dt)
+        .def_readwrite("nmpc_fine", &Tuning::nmpc_fine);
     m.def("load_tuning", [](const std::string& dynamics) { return load_tuning(dynamics); },
           "NMPC margins for 'bicycle', 'chrono' or 'carla' from config/tuning.json");
+
+    py::class_<Zone>(m, "Zone", "a place for the NMPC to keep out of, in path coordinates (track_control/directive.hpp)")
+        .def(py::init([](double s, double e_y, double length, double width, double speed) {
+                 return Zone{s, e_y, length, width, speed};
+             }),
+             py::arg("s"), py::arg("e_y"), py::arg("length") = 1.0, py::arg("width") = 1.0, py::arg("speed") = 0.0)
+        .def_readwrite("s", &Zone::s)
+        .def_readwrite("e_y", &Zone::e_y)
+        .def_readwrite("length", &Zone::length)
+        .def_readwrite("width", &Zone::width)
+        .def_readwrite("speed", &Zone::speed);
+
+    py::class_<Intent>(m, "Intent", "a driving intent: keep_lane, lane_left, lane_right, set_speed, more_gap, cautious, avoid")
+        .def(py::init([](const std::string& kind, double value, std::optional<Zone> zone) {
+                 Intent i;
+                 i.kind = intent_kind(kind);
+                 i.value = value;
+                 if (zone) i.zone = *zone;
+                 return i;
+             }),
+             py::arg("kind"), py::arg("value") = NAN, py::arg("zone") = py::none());
 
     py::class_<Driver>(m, "Driver")
         .def(py::init([](const std::string& controller, const Circuit& circuit, const VehicleParams& params,
@@ -135,6 +178,7 @@ PYBIND11_MODULE(trackctl, m) {
                                            r["iterations"] = s.iterations, r["success"] = s.success;
                                            r["status"] = s.status, r["warm"] = s.warm;
                                            r["n_obstacles"] = s.n_obstacles, r["obj"] = s.obj;
+                                           r["directive"] = s.directive;
                                            r["slack_obstacle"] = s.slack_max[0], r["slack_edge"] = s.slack_max[1];
                                            r["slack_sideslip"] = s.slack_max[2], r["slack_speed"] = s.slack_max[3];
                                            r["x0_gap"] = s.x0_gap;
@@ -143,6 +187,42 @@ PYBIND11_MODULE(trackctl, m) {
                                    return out;
                                },
                                "per solve: a dict of NMPC::SolveStats (times in seconds)")
+        .def(
+            "set_directive",
+            [](Driver& d, std::map<std::string, double> weights, std::map<std::string, double> limits,
+               std::vector<Zone> zones, double ttl, std::optional<double> t) {
+                Directive directive;
+                directive.weights = std::move(weights);
+                directive.limits = std::move(limits);
+                directive.zones = std::move(zones);
+                directive.ttl = ttl;
+                directive.t = t.value_or(NAN);
+                return nmpc_of(d).set_directive(std::move(directive));
+            },
+            py::arg("weights") = std::map<std::string, double>(), py::arg("limits") = std::map<std::string, double>(),
+            py::arg("zones") = std::vector<Zone>(), py::arg("ttl") = 2.0, py::arg("t") = py::none(),
+            "override NMPC weights and limits by name and add keep-out zones for `ttl` seconds from `t` (default: the "
+            "next solve); values are clamped to `directive_ranges`, and the returned list says what was changed")
+        .def(
+            "set_intents",
+            [](Driver& d, const std::vector<Intent>& intents, double ttl, std::optional<double> t) {
+                NMPC& nmpc = nmpc_of(d);
+                return nmpc.set_directive(nmpc.interpret(intents, t.value_or(NAN), ttl));
+            },
+            py::arg("intents"), py::arg("ttl") = 2.0, py::arg("t") = py::none(),
+            "the directive for driving intents (a list of trackctl.Intent), as set_directive")
+        .def("clear_directive", [](Driver& d) { nmpc_of(d).clear_directive(); })
+        .def_property_readonly("directed", [](Driver& d) { return nmpc_of(d).directed(); })
+        .def_property_readonly(
+            "directive_ranges",
+            [](Driver& d) {
+                NMPC& nmpc = nmpc_of(d);
+                py::dict out;
+                out["weights"] = ranges(nmpc.weight_ranges());
+                out["limits"] = ranges(nmpc.limit_ranges());
+                return out;
+            },
+            "{'weights': {name: (lo, hi, default)}, 'limits': {...}}: what a directive may set")
         .def_property_readonly("failures",
                                [](Driver& d) {
                                    auto* nmpc = dynamic_cast<NMPC*>(&d.controller());
@@ -162,10 +242,12 @@ PYBIND11_MODULE(trackctl, m) {
     py::class_<FallbackControl>(m, "FallbackControl",
                                 "the NMPC with pure pursuit as its fallback, on their own threads against the running "
                                 "bicycle plant (sim/racetrack/fallback_control.hpp)")
-        .def(py::init([](Driver& nmpc, Driver& pure_pursuit, double rate, double deadline) {
-                 return std::make_unique<FallbackControl>(nmpc, pure_pursuit, FallbackControl::Options{rate, deadline});
+        .def(py::init([](Driver& nmpc, Driver& pure_pursuit, double rate, double period, double blend) {
+                 return std::make_unique<FallbackControl>(nmpc, pure_pursuit,
+                                                          FallbackControl::Options{rate, period, blend});
              }),
-             py::arg("nmpc"), py::arg("pure_pursuit"), py::arg("rate") = 100.0, py::arg("deadline") = 0.1,
+             py::arg("nmpc"), py::arg("pure_pursuit"), py::arg("rate") = 50.0, py::arg("period") = 0.2,
+             py::arg("blend") = 0.2,
              py::keep_alive<1, 2>(), py::keep_alive<1, 3>())
         .def("start", &FallbackControl::start)
         .def("stop", &FallbackControl::stop, py::call_guard<py::gil_scoped_release>())
@@ -175,13 +257,17 @@ PYBIND11_MODULE(trackctl, m) {
                  py::dict d;
                  d["source"] = source_name(s.source), d["reason"] = s.reason, d["plan_age"] = s.plan_age;
                  d["last_solve"] = s.last_solve, d["last_converged"] = s.last_converged;
-                 d["ticks"] = s.ticks, d["nmpc_ticks"] = s.nmpc_ticks, d["pure_pursuit_ticks"] = s.pure_pursuit_ticks;
+                 d["weight"] = s.weight, d["ticks"] = s.ticks, d["nmpc_ticks"] = s.nmpc_ticks;
+                 d["pure_pursuit_ticks"] = s.pure_pursuit_ticks, d["blend_ticks"] = s.blend_ticks;
                  d["solves"] = s.solves, d["solves_on_time"] = s.solves_on_time;
                  d["pure_pursuit_updates"] = s.pure_pursuit_updates;
+                 d["nmpc_input"] = s.nmpc_u, d["pure_pursuit_input"] = s.pure_pursuit_u;
                  return d;
              },
-             "source ('nmpc', 'pure_pursuit' or 'none') of the last command, the reason for pure pursuit, the "
-             "plan's age [s], the last solve's wall time [s] and convergence, and counts")
+             "source ('nmpc', 'pure_pursuit', 'blend' or 'none') of the last command and pure pursuit's share of it "
+             "(weight), the reason for pure pursuit, the plan's age [s], the last solve's wall time [s] and "
+             "convergence, counts, and the input [delta_rate, Fx] each controller would command now (NaN while it "
+             "has none)")
         .def_property_readonly("plan", &FallbackControl::plan, "(s, e_y) of the NMPC plan in use; empty if none");
 
     py::class_<PlantModel>(m, "PlantModel")

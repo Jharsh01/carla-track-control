@@ -113,6 +113,32 @@ def test_nmpc_laps_on_bicycle_dynamics(tmp_path):
     assert status == 0 and r["completed"] and not r["collided"]
 
 
+def test_nmpc_takes_directives():
+    params = trackctl.VehicleParams.from_file(os.path.join(REPO, "config", "vehicles", "model3.json"))
+    driver = trackctl.Driver("nmpc", CIRCUIT, params, trackctl.Perception.exact(CIRCUIT))
+    ranges = driver.directive_ranges
+    assert set(ranges["weights"]) == {"speed", "lane", "lat", "accel", "rate", "slack"}
+    assert ranges["limits"]["speed_cap"][1] == pytest.approx(CIRCUIT.v_max)
+    # clamped to the ranges, and unknown names refused
+    notes = driver.set_directive(limits={"speed_cap": 100.0}, ttl=5.0)
+    assert len(notes) == 1 and "speed_cap" in notes[0]
+    with pytest.raises(ValueError):
+        driver.set_directive(weights={"comfort": 1.0})
+    zone = trackctl.Zone(s=80.0, e_y=CIRCUIT.lane_offset(CIRCUIT.ego_lane), length=4.0, width=2.0)
+    # the driver's NMPC has no zone slots (Options::n_zones = 0): the zone is left out, the speed cap taken
+    notes = driver.set_intents([trackctl.Intent("set_speed", 10.0), trackctl.Intent("avoid", zone=zone)])
+    assert len(notes) == 1 and "n_zones" in notes[0]
+    assert driver.directed
+    x = CIRCUIT.initial_state()
+    for k in range(3):
+        driver(0.05 * k, x)
+    assert all(row["directive"] for row in driver.solve_stats)
+    driver.clear_directive()
+    assert not driver.directed
+    with pytest.raises(ValueError):
+        trackctl.Intent("fly")
+
+
 def test_bicycle_plant_thread_shares_its_state():
     import time
 
@@ -147,18 +173,26 @@ def test_threads_run_side_by_side(tmp_path, capsys):
 def test_nmpc_with_pure_pursuit_fallback(tmp_path, capsys):
     import re
 
+    pattern = re.compile(r"command ([\d.]+) Hz \(NMPC (\d+), pure pursuit (\d+), blended (\d+)\), "
+                         r"NMPC ([\d.]+) solves/s \((\d+) of (\d+) on time\), pure pursuit ([\d.]+) Hz")
     status, r = lap("nmpc_fallback", "bicycle", tmp_path, "--t-max", "3", "--no-video")
     assert not r["collided"] and not r["left_track"]
-    out = capsys.readouterr().out
-    rates = re.search(r"command ([\d.]+) Hz \(NMPC (\d+), pure pursuit (\d+)\), NMPC [\d.]+ solves/s "
-                      r"\((\d+) of (\d+) on time\), pure pursuit ([\d.]+) Hz", out)
-    command, nmpc, pure_pursuit, on_time, solves, pure_pursuit_rate = map(float, rates.groups())
-    assert command == pytest.approx(100.0, rel=0.1)  # a command every 10 ms, whoever's it is
-    assert pure_pursuit_rate == pytest.approx(100.0, rel=0.1) and solves > 0
-    assert nmpc + pure_pursuit >= 0.9 * 100 * 3 and pure_pursuit > 0
-    assert r["nmpc_command_share"] == pytest.approx(nmpc / (nmpc + pure_pursuit))
+    command, nmpc, pure_pursuit, blended, solve_rate, on_time, solves, pure_pursuit_rate = map(
+        float, pattern.search(capsys.readouterr().out).groups())
+    assert command == pytest.approx(50.0, rel=0.1)  # a command every 20 ms, whoever's it is
+    assert pure_pursuit_rate == pytest.approx(50.0, rel=0.1)
+    assert 0 < solve_rate <= 5.0 * 1.1  # a solve every 200 ms at most
+    # pure pursuit drives until the first plan, then hands over to the NMPC over 200 ms: 10 blended commands
+    assert nmpc + pure_pursuit + blended >= 0.9 * 50 * 3 and pure_pursuit > 0 and blended >= 9
+    total = nmpc + pure_pursuit + blended
+    assert r["nmpc_command_share"] == pytest.approx(nmpc / total)
+    assert r["blend_command_share"] == pytest.approx(blended / total)
     with open(tmp_path / "nmpc_fallback_bicycle.csv") as f:
-        assert {row["command"] for row in __import__("csv").DictReader(f)} <= {"nmpc", "pure_pursuit", "none"}
+        assert {row["command"] for row in __import__("csv").DictReader(f)} <= {"nmpc", "pure_pursuit", "blend", "none"}
+
+    # --blend 0: a switch, no command blended
+    lap("nmpc_fallback", "bicycle", tmp_path, "--t-max", "1.5", "--no-video", "--blend", "0")
+    assert pattern.search(capsys.readouterr().out).group(4) == "0"
 
 
 def test_command_banner():
@@ -171,6 +205,11 @@ def test_command_banner():
     status.update(source="nmpc", plan_age=0.043)
     text, detail, color = command_banner(status, 0.1)
     assert text == "COMMAND: NMPC" and "43 ms" in detail and color == COMMAND_COLORS["nmpc"]
+    status.update(source="blend", weight=0.25, reason="NMPC solve past 200 ms")
+    text, detail, color = command_banner(status, 0.2)
+    assert "NMPC 75% / PP 25%" in text and "past 200 ms" in detail and color == COMMAND_COLORS["blend"]
+    status.update(reason="")
+    assert "back to the NMPC" in command_banner(status, 0.2)[1]
 
 
 def video_size(path):
@@ -182,13 +221,38 @@ def video_size(path):
     return size
 
 
-def test_rate_panel_widens_the_video(tmp_path):
-    from carla_bridge.view import RatePanel
+def test_panels_widen_the_video(tmp_path):
+    from carla_bridge.view import InputPanel, RatePanel
 
     lap("pure_pursuit", "carla", tmp_path, "--t-max", "0.5")
-    assert video_size(tmp_path / "pure_pursuit_carla.mp4") == (1280 + RatePanel.WIDTH, 720)
+    assert video_size(tmp_path / "pure_pursuit_carla.mp4") == (1280 + InputPanel.WIDTH + RatePanel.WIDTH, 720)
     lap("pure_pursuit", "carla", tmp_path, "--t-max", "0.5", "--no-rates")
+    assert video_size(tmp_path / "pure_pursuit_carla.mp4") == (1280 + InputPanel.WIDTH, 720)
+    lap("pure_pursuit", "carla", tmp_path, "--t-max", "0.5", "--no-rates", "--no-inputs")
     assert video_size(tmp_path / "pure_pursuit_carla.mp4") == (1280, 720)
+
+
+def test_input_panel():
+    from carla_bridge.view import InputPanel
+
+    params = trackctl.VehicleParams.from_file(os.path.join(trackctl.config_dir, "vehicles", "model3.json"))
+    panel = InputPanel(params, ["nmpc", "pure_pursuit"])
+    nan = float("nan")
+    for i in range(300):  # 12 s at 25 Hz: longer than the window; the NMPC has no input for the first second
+        t = 0.04 * i
+        nmpc = [nan, nan] if t < 1.0 else [0.1, -params.F_brake_max]
+        panel.add(t, {"nmpc": np.array(nmpc), "pure_pursuit": np.array([-0.6, 2000.0])},
+                  "pure_pursuit" if t < 1.0 else "nmpc")
+    assert panel.accel["nmpc"][-1] == pytest.approx(-params.F_brake_max / params.m)
+    assert panel.rate["pure_pursuit"][-1] == pytest.approx(math.degrees(-0.6))
+    assert math.isnan(panel.accel["nmpc"][0])
+    assert panel.draw(np.zeros((720, 1280, 3), np.uint8)).shape == (720, 1280 + InputPanel.WIDTH, 3)
+
+    single = InputPanel(params, ["pure_pursuit"])  # one controller, no source: nothing drawn yet, then a sample
+    assert single.draw(np.zeros((720, 1280, 3), np.uint8)).shape == (720, 1280 + InputPanel.WIDTH, 3)
+    single.cached = None
+    single.add(0.0, {"pure_pursuit": np.array([0.0, 0.0])})
+    assert single.draw(np.zeros((720, 1280, 3), np.uint8)).shape == (720, 1280 + InputPanel.WIDTH, 3)
 
 
 def test_rate_panel_averages():
