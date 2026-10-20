@@ -1,28 +1,34 @@
 // The NMPC with pure pursuit as its fallback, both running at once against the
 // real-time bicycle plant (sim/plant/bicycle_plant.hpp), each on its own thread.
 //
-//   NMPC thread          solves back to back, each solve allowed `deadline`
-//                        seconds of wall time. A solve started at plant time t
-//                        plans from t + deadline: from the state the car will
-//                        have then, predicted with the bicycle model holding the
-//                        input being applied. So a solve that makes the deadline
-//                        delivers its plan before the plan begins.
-//   pure pursuit thread  every period (1 / rate), from the plant's latest state
-//   command thread       every period, commands the plant (bicycle_state) with
-//                        - the NMPC plan whose start has come, played back at the
-//                          plant's time (the input it planned for that moment),
-//                          if its solve converged within the deadline;
-//                        - pure pursuit's latest input otherwise: when that solve
-//                          did not converge or ran past the deadline, or the solve
-//                          under way has not delivered by the time its plan should
-//                          begin.
+//   NMPC thread          solves every `period` seconds (200 ms). A solve started
+//                        at plant time t plans from t + period: from the state
+//                        the car will have then, predicted with the bicycle model
+//                        and the inputs the current plan sends meanwhile. Each
+//                        plan is played for one period, `rate` x `period`
+//                        commands (10 at 50 Hz), until the next takes over. A
+//                        solve that runs past its period is not dropped: its plan
+//                        takes over when it arrives, from the input it planned for
+//                        that moment, and the next solve starts at once.
+//   pure pursuit thread  every 1 / rate, from the plant's latest state
+//   command thread       every 1 / rate, commands the plant (bicycle_state) with a
+//                        blend of the two, (1 - w) u_nmpc + w u_pure_pursuit, the
+//                        weight w moving to 0 while the NMPC has a plan for the
+//                        moment and to 1 while it has none (its solve is past its
+//                        period, did not converge, or its plan ran out), across
+//                        the whole range in `blend` seconds, so a handover either
+//                        way is a ramp rather than a step. While handing over to
+//                        pure pursuit the NMPC's part is its last plan carried on
+//                        past its period (it covers the whole horizon), or its
+//                        last input once that runs out.
 //
 // So an input is commanded every period whatever the NMPC does, and `status`
-// says which controller's it is, and why pure pursuit's when it is.
+// says whose it is (or that it is a blend), and why pure pursuit's when it is.
 #pragma once
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -38,21 +44,26 @@ namespace sim {
 class FallbackControl {
 public:
     struct Options {
-        double rate = 100.0;  // command and pure pursuit [Hz]
-        double deadline = 0.1;  // wall time an NMPC solve may take [s]
+        double rate = 50.0;  // command and pure pursuit [Hz]
+        double period = 0.2;  // a solve every period; the plan it makes starts a period after the solve does [s]
+        double blend = 0.2;  // time a handover from one controller to the other takes [s]; 0: a switch
     };
 
-    enum class Source { none, nmpc, pure_pursuit };
+    enum class Source { none, nmpc, pure_pursuit, blend };
 
     struct Status {
         Source source = Source::none;  // whose input was commanded last
         std::string reason;  // why pure pursuit's, when it was
-        double plan_age = 0.0;  // plant time since the observation the NMPC plan in use started from [s]
+        double plan_age = 0.0;  // plant time since the start of the NMPC plan in use [s]
         double last_solve = 0.0;  // wall time of the last NMPC solve [s]
         bool last_converged = false;
-        uint64_t ticks = 0, nmpc_ticks = 0, pure_pursuit_ticks = 0;  // commands, and whose
-        uint64_t solves = 0, solves_on_time = 0;  // NMPC solves, and those converged within the deadline
+        double weight = 1.0;  // pure pursuit's share of the last command: 0 the NMPC's alone, 1 pure pursuit's alone
+        uint64_t ticks = 0, nmpc_ticks = 0, pure_pursuit_ticks = 0, blend_ticks = 0;  // commands, and whose
+        uint64_t solves = 0, solves_on_time = 0;  // NMPC solves, and those converged within the period
         uint64_t pure_pursuit_updates = 0;
+        // What each would command now, whoever is in command: the NMPC's input from its latest converged plan,
+        // pure pursuit's latest; NaN while there is none.
+        Input nmpc_u = Input::Constant(NAN), pure_pursuit_u = Input::Constant(NAN);
     };
 
     // Both drivers must outlive this and are used only by its threads while it runs.
@@ -83,7 +94,8 @@ private:
     struct Plan {
         bool valid = false;
         std::string reason = "no NMPC solve yet";
-        double t0 = 0.0, h = 0.1;
+        double t0 = 0.0;
+        std::vector<double> times;  // when each step starts, from t0, as NMPC::times
         Eigen::MatrixXd inputs, path;  // as NMPC::plan_inputs and NMPC::plan
     };
 
@@ -96,6 +108,9 @@ private:
     // pure pursuit's latest input
     bool pure_pursuit_valid_ = false;
     Input pure_pursuit_u_ = Input::Zero();
+    // the NMPC's last input, its part of a blend once its plan has run out
+    bool nmpc_valid_ = false;
+    Input nmpc_u_ = Input::Zero();
     Status status_;
 };
 

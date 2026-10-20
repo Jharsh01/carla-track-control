@@ -16,9 +16,11 @@ With --dynamics bicycle, three threads run side by side in real time: the plant
 at 1 kHz (C++, timer-driven), the controller at --control-rate (100 Hz), and the
 CARLA world (draw, camera, log) at --world-rate (25 Hz). With --controller nmpc_fallback the
 controller is three threads (C++, sim/racetrack/fallback_control.hpp): the NMPC
-solving back to back, pure pursuit at --control-rate, and the command thread
-sending the NMPC's planned input while the NMPC is on time (converged within
---nmpc-deadline) and pure pursuit's otherwise; the HUD says which. They share the state and the input through the
+solving every --nmpc-period (200 ms), each plan played for one period (10
+commands at 50 Hz), pure pursuit at --control-rate, and the command thread
+sending the NMPC's planned input while it has a plan for the moment and pure
+pursuit's otherwise, ramping from one to the other over --blend seconds; a late
+solve is not dropped, its plan takes over when it arrives. The HUD says whose input it is. They share the state and the input through the
 global trackctl.bicycle_state, each taking the latest value: nothing waits for
 an NMPC solve, so a slow solve leaves the car on its last input. --lockstep
 runs them one after the other instead, as the other dynamics do.
@@ -43,19 +45,32 @@ VEHICLE_FILES = {"carla": "model3.json", "chrono": "chrono_sedan.json", "bicycle
 # columns of <stem>_solves.csv, one row per NMPC solve (NMPC::SolveStats; build/simulate writes the same)
 SOLVE_COLUMNS = ["t", "s0", "ux0", "t_wall", "t_total", "t_proc", "t_hess", "t_jac", "t_grad", "t_f", "t_g",
                  "iterations", "success", "status", "warm", "n_obstacles", "obj", "slack_obstacle", "slack_edge",
-                 "slack_sideslip", "slack_speed", "x0_gap"]
+                 "slack_sideslip", "slack_speed", "x0_gap", "directive"]
 
 
 def parse(argv=None):
     p = argparse.ArgumentParser(prog="python -m carla_bridge", description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--controller", choices=["nmpc", "pure_pursuit", "both", "nmpc_fallback"], default="both",
-                   help="nmpc_fallback (threaded bicycle only): the NMPC and pure pursuit both running, pure pursuit's "
-                        "input commanded whenever the NMPC is not on time")
-    p.add_argument("--control-rate", type=float, default=100.0,
-                   help="threaded: rate at which an input is commanded [Hz] (pure pursuit computes at it too)")
-    p.add_argument("--nmpc-deadline", type=float, default=0.1,
-                   help="nmpc_fallback: wall time an NMPC solve may take [s]; later or not converged: pure pursuit")
+                   help="nmpc_fallback (threaded bicycle only): the NMPC and pure pursuit both running, the input "
+                        "blended to pure pursuit's whenever the NMPC has no plan for the moment")
+    p.add_argument("--control-rate", type=float,
+                   help="threaded: rate at which an input is commanded [Hz] (pure pursuit computes at it too); "
+                        "default 50 with nmpc_fallback, otherwise 100")
+    p.add_argument("--nmpc-period", "--nmpc-deadline", type=float, default=0.2, dest="nmpc_period",
+                   help="nmpc_fallback: an NMPC solve every this many seconds, its plan starting a period later and "
+                        "played for one period; a solve past it is kept, pure pursuit blended in until it arrives")
+    p.add_argument("--nmpc-dt", type=float, default=0.0,
+                   help="the NMPC's step [s], after the fine ones (0: its default, 0.1 s)")
+    p.add_argument("--nmpc-horizon", type=float,
+                   help="how far the NMPC plans [s]; default 2 with nmpc_fallback, otherwise the NMPC's (4)")
+    p.add_argument("--nmpc-fine-dt", type=float,
+                   help="a finer NMPC step for the first --nmpc-fine seconds [s]; default with nmpc_fallback one "
+                        "command (1 / --control-rate) for one --nmpc-period, the part of each plan played; "
+                        "otherwise none")
+    p.add_argument("--nmpc-fine", type=float, help="how long the fine steps last [s]")
+    p.add_argument("--blend", type=float, default=0.2,
+                   help="nmpc_fallback: seconds a handover between the NMPC and pure pursuit takes (0: a switch)")
     p.add_argument("--dynamics", choices=["carla", "chrono", "bicycle"], default="carla",
                    help="who simulates the ego car: CARLA's vehicle physics, the Project Chrono sedan or the "
                         "controllers' own bicycle model (the offline plant)")
@@ -74,6 +89,8 @@ def parse(argv=None):
     p.add_argument("--stream", type=int, metavar="PORT", help="serve the camera view live on this port")
     p.add_argument("--no-rates", action="store_true",
                    help="no side panel plotting the controller's and the plant's average rate in wall-clock Hz")
+    p.add_argument("--no-inputs", action="store_true",
+                   help="no side panel plotting the controllers' inputs (acceleration and steering rate)")
     p.add_argument("--no-plan", action="store_true", help="do not draw the NMPC's predicted path in the world")
     p.add_argument("--lockstep", action="store_true",
                    help="with --dynamics bicycle: one loop, controller then plant then CARLA tick, CARLA waiting "
@@ -84,7 +101,17 @@ def parse(argv=None):
                    help="threaded: rate of the CARLA world thread [Hz]: ticks, camera frames, video, log")
     p.add_argument("--no-scenery", action="store_true",
                    help="CARLA's plain generated road instead of asphalt, kerbs, grass, barriers and trees")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    fallback = args.controller == "nmpc_fallback"
+    if args.control_rate is None:
+        args.control_rate = 50.0 if fallback else 100.0
+    if args.nmpc_horizon is None:
+        args.nmpc_horizon = 2.0 if fallback else 0.0
+    if args.nmpc_fine_dt is None:
+        args.nmpc_fine_dt = 1.0 / args.control_rate if fallback else 0.0
+    if args.nmpc_fine is None:
+        args.nmpc_fine = args.nmpc_period if fallback else 0.0
+    return args
 
 
 class Run:
@@ -169,6 +196,16 @@ def write_solves(path, stats):
         w.writerows(stats)
 
 
+def name_os_thread(name):
+    """Give the calling thread `name` where top -H and the like show it (Linux; up to 15 characters)."""
+    try:
+        import ctypes
+
+        ctypes.CDLL(None).prctl(15, name.encode()[:15], 0, 0, 0)  # PR_SET_NAME
+    except (OSError, AttributeError):
+        pass
+
+
 class ViewThread(threading.Thread):
     """Draws the HUD and rate panel on the camera frames and writes them to the video and stream, off the CARLA
     world thread: that thread hands over its latest frame and goes on. A frame the view has no time for is
@@ -190,6 +227,7 @@ class ViewThread(threading.Thread):
             self.ready.notify()
 
     def run(self):
+        name_os_thread("view")
         try:
             while True:
                 with self.ready:
@@ -227,6 +265,7 @@ class ControllerThread(threading.Thread):
         self.error = None
 
     def run(self):
+        name_os_thread("controller")
         try:
             next_time = time.perf_counter()
             while not self.halt.is_set():
@@ -259,11 +298,12 @@ def drive(args, client, circuit, controller, stream=None):
     perception = (trackctl.Perception.exact(circuit) if args.perfect else
                   trackctl.Perception.noisy(circuit, road_range=args.road_range, seed=args.seed))
     tuning = trackctl.load_tuning(dynamics_name)
+    tuning.nmpc_dt, tuning.nmpc_horizon = args.nmpc_dt, args.nmpc_horizon
+    tuning.nmpc_fine_dt, tuning.nmpc_fine = args.nmpc_fine_dt, args.nmpc_fine
     fallback_driver = None
     if controller == "nmpc_fallback":
         if dynamics_name != "bicycle" or args.lockstep:
             raise SystemExit("--controller nmpc_fallback needs --dynamics bicycle without --lockstep")
-        tuning.solve_time_limit = args.nmpc_deadline
         driver = trackctl.Driver("nmpc", circuit, params, perception, tuning)
         fallback_perception = (trackctl.Perception.exact(circuit) if args.perfect else
                                trackctl.Perception.noisy(circuit, road_range=args.road_range, seed=args.seed))
@@ -282,16 +322,19 @@ def drive(args, client, circuit, controller, stream=None):
             world, circuit, params, world_dt)
         actors.append(dynamics)
         traffic.place(0.0)
-        camera = video = hud = rates = None
+        camera = video = hud = rates = inputs = None
         width = 1280
         if not args.no_video or stream:
             camera = view.ChaseCamera(world, dynamics.actor)
             actors.append(camera)
             hud = view.Hud(circuit)
+            if not args.no_inputs:
+                inputs = view.InputPanel(params, ["nmpc", "pure_pursuit", "command"] if fallback_driver else [controller])
+                width += view.InputPanel.WIDTH
             if not args.no_rates:
                 if fallback_driver:
                     rates = view.RatePanel(world_dt, series=view.RatePanel.FALLBACK, real_time={
-                        "command": args.control_rate, "nmpc": 1.0 / args.nmpc_deadline,
+                        "command": args.control_rate, "nmpc": 1.0 / args.nmpc_period,
                         "pure_pursuit": args.control_rate, "plant": args.plant_rate})
                 elif threaded:
                     rates = view.RatePanel(world_dt, series=view.RatePanel.THREADS,
@@ -322,6 +365,8 @@ def drive(args, client, circuit, controller, stream=None):
                                    args.laps * circuit.track.length, solve_time)
             traffic_xy = [(p.x, p.y) for p in (circuit.traffic_pose(i, t) for i in range(circuit.n_traffic))]
             rgb = hud.draw(rgb, lines, (x[0], x[1]), traffic_xy, banner)
+            if inputs:
+                rgb = inputs.draw(rgb)
             return rates.draw(rgb) if rates else rgb
 
         def publish(rgb, frames=1):
@@ -349,13 +394,14 @@ def drive(args, client, circuit, controller, stream=None):
             if viewer:
                 viewer.start()
             try:
-                extra = run_threads(args, world, circuit, controller, driver, dynamics, traffic, run, rates, capture,
-                                    viewer, fallback_driver, world_dt)
+                extra = run_threads(args, world, circuit, controller, driver, dynamics, traffic, run, rates, inputs,
+                                    capture, viewer, fallback_driver, world_dt)
             finally:
                 if viewer:
                     viewer.finish()
         else:
-            run_lockstep(args, world, circuit, controller, driver, dynamics, traffic, run, rates, show, friction)
+            run_lockstep(args, world, circuit, controller, driver, dynamics, traffic, run, rates, inputs, show,
+                         friction)
         if video:
             video.close()
 
@@ -384,7 +430,7 @@ def drive(args, client, circuit, controller, stream=None):
         world.apply_settings(original_settings)
 
 
-def run_lockstep(args, world, circuit, controller, driver, dynamics, traffic, run, rates, show, friction):
+def run_lockstep(args, world, circuit, controller, driver, dynamics, traffic, run, rates, inputs, show, friction):
     """One loop: the controller, then the plant through the world step, then CARLA's tick; CARLA waits for both."""
     t = 0.0
     x = np.asarray(dynamics.state())
@@ -408,11 +454,13 @@ def run_lockstep(args, world, circuit, controller, driver, dynamics, traffic, ru
         t += args.dt
         if rates:
             rates.add(t, controller_time, plant_time)
+        if inputs:
+            inputs.add(t, {controller: u})
         x = np.asarray(dynamics.state())
         show(frame, t, x, e_y, run.progress, driver.last_solve_time)
 
 
-def run_threads(args, world, circuit, controller, driver, dynamics, traffic, run, rates, capture, viewer,
+def run_threads(args, world, circuit, controller, driver, dynamics, traffic, run, rates, inputs, capture, viewer,
                 fallback_driver=None, world_dt=0.04):
     """The plant (its own C++ thread), the controller (a Python thread; or, with `fallback_driver`, the NMPC, pure
     pursuit and the command thread in C++) and the CARLA world (this thread), each at its own rate in real time,
@@ -425,8 +473,9 @@ def run_threads(args, world, circuit, controller, driver, dynamics, traffic, run
     u0 = np.asarray(driver(0.0, x0))  # the first solve (the NMPC's is slow) before the clocks start
     keep_plan = not args.no_plan and controller in ("nmpc", "nmpc_fallback")
     if fallback_driver:
-        u0 = np.asarray(fallback_driver(0.0, x0))  # the NMPC's cold solve may not have made the deadline
-        control = trackctl.FallbackControl(driver, fallback_driver, rate=args.control_rate, deadline=args.nmpc_deadline)
+        u0 = np.asarray(fallback_driver(0.0, x0))  # pure pursuit drives until the NMPC's first plan
+        control = trackctl.FallbackControl(driver, fallback_driver, rate=args.control_rate, period=args.nmpc_period,
+                                           blend=args.blend)
     else:
         control = ControllerThread(driver, 1.0 / args.control_rate, keep_plan)
     dynamics.start(u0, rate=args.plant_rate)
@@ -450,9 +499,14 @@ def run_threads(args, world, circuit, controller, driver, dynamics, traffic, run
                 status = control.status()
                 run.rows[-1].append(status["source"])
                 plan, solve_time = control.plan, status["last_solve"] or None
-                banner = view.command_banner(status, args.nmpc_deadline)
+                banner = view.command_banner(status, args.nmpc_period)
+                if inputs:
+                    inputs.add(t, {"nmpc": status["nmpc_input"], "pure_pursuit": status["pure_pursuit_input"],
+                                   "command": u}, status["source"])
             else:
                 plan, solve_time = control.plan, control.last_solve
+                if inputs:
+                    inputs.add(t, {controller: u})
             if run.done or t >= args.t_max:
                 break
             dynamics.after_tick()  # the car where the plant has it now
@@ -485,10 +539,10 @@ def run_threads(args, world, circuit, controller, driver, dynamics, traffic, run
     timing = dynamics.plant.timing()
     if fallback_driver:
         status = control.status()
-        commands = "command %.1f Hz (NMPC %d, pure pursuit %d), NMPC %.1f solves/s (%d of %d on time), " \
+        commands = "command %.1f Hz (NMPC %d, pure pursuit %d, blended %d), NMPC %.1f solves/s (%d of %d on time), " \
                    "pure pursuit %.1f Hz" % (status["ticks"] / wall, status["nmpc_ticks"], status["pure_pursuit_ticks"],
-                                            status["solves"] / wall, status["solves_on_time"], status["solves"],
-                                            status["pure_pursuit_updates"] / wall)
+                                            status["blend_ticks"], status["solves"] / wall, status["solves_on_time"],
+                                            status["solves"], status["pure_pursuit_updates"] / wall)
     else:
         commands = "controller %.1f Hz" % (control.solves / wall)
     drawn = ", view %.1f Hz (%d of %d frames drawn, the others repeated in the video)" % (
@@ -501,8 +555,9 @@ def run_threads(args, world, circuit, controller, driver, dynamics, traffic, run
     if not fallback_driver:
         return {}
     ticks_total = max(1, status["ticks"])
-    return {"nmpc_command_share": status["nmpc_ticks"] / ticks_total, "nmpc_solves": status["solves"],
-            "nmpc_solves_on_time": status["solves_on_time"], "nmpc_deadline": args.nmpc_deadline,
+    return {"nmpc_command_share": status["nmpc_ticks"] / ticks_total,
+            "blend_command_share": status["blend_ticks"] / ticks_total, "nmpc_solves": status["solves"],
+            "nmpc_solves_on_time": status["solves_on_time"], "nmpc_period": args.nmpc_period, "blend": args.blend,
             "control_rate": args.control_rate}
 
 
@@ -534,7 +589,7 @@ def report(r, wall):
     if "time_share" in r:
         share = r["time_share"]
         detail = ("%-13s solve p50 %.0f ms, p95 %.0f ms, over dt %.0f%%   iterations mean %.1f, max %d"
-                  "   time in hessian %.0f%%, jacobian %.0f%%, ipopt %.0f%%   cpu/wall %.2f   first solve %.0f ms"
+                  "   time in hessian %.0f%%, jacobian %.0f%%, solver %.0f%%   cpu/wall %.2f   first solve %.0f ms"
                   % ("", 1e3 * r["solve_p50"], 1e3 * r["solve_p95"], 100 * r["overrun_fraction"], r["iter_mean"],
                      r["iter_max"], 100 * share["hess"], 100 * share["jac"], 100 * share["ipopt_internal"],
                      r["proc_over_wall"], 1e3 * r["first_solve"]))

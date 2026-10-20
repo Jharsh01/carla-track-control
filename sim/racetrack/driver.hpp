@@ -27,6 +27,9 @@ struct Tuning {
     double drive_use = 1.0;
     double sideslip_max = 7.0 * M_PI / 180.0;
     double solve_time_limit = 0.0;  // [s] wall time an NMPC solve may take before it gives up; 0: no limit
+    double nmpc_dt = 0.0;  // [s] the NMPC's step; 0: its default (NMPC::Options::h)
+    double nmpc_horizon = 0.0;  // [s] how far the NMPC plans; 0: its default (NMPC::Options::horizon)
+    double nmpc_fine_dt = 0.0, nmpc_fine = 0.0;  // [s] a finer step for the first nmpc_fine seconds; 0: none
 };
 
 // The NMPC margins for a vehicle dynamics ("bicycle", "chrono", "carla") from

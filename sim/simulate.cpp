@@ -57,14 +57,15 @@ struct Args {
     unsigned seed = 0;
     double speed_limit = 0.0;  // [km/h]; 0: the track's
     // NMPC margins given on the command line; the rest come from config/tuning.json for the plant
-    std::optional<double> mu_use, brake_use, drive_use, sideslip_deg;
+    std::optional<double> mu_use, brake_use, drive_use, sideslip_deg, nmpc_dt, nmpc_horizon, nmpc_fine_dt, nmpc_fine;
     Tuning tuning;
 };
 
 const char* USAGE =
     "usage: simulate [--controller both|nmpc|pure_pursuit] [--plant bicycle|chrono] [--params FILE] [--track FILE]\n"
     "                [--out DIR] [--perfect] [--range M] [--noise K] [--ego-noise K] [--road-range M] [--seed N]\n"
-    "                [--speed-limit KMH] [--mu-use K] [--brake-use K] [--drive-use K] [--sideslip DEG]\n";
+    "                [--speed-limit KMH] [--mu-use K] [--brake-use K] [--drive-use K] [--sideslip DEG]\n"
+    "                [--nmpc-dt S] [--nmpc-horizon S] [--nmpc-fine-dt S --nmpc-fine S]\n";
 
 Args parse(int argc, char** argv) {
     Args a;
@@ -94,6 +95,10 @@ Args parse(int argc, char** argv) {
         else if (w == "--drive-use") a.drive_use = std::stod(value());
         else if (w == "--speed-limit") a.speed_limit = std::stod(value());
         else if (w == "--sideslip") a.sideslip_deg = std::stod(value());
+        else if (w == "--nmpc-dt") a.nmpc_dt = std::stod(value());
+        else if (w == "--nmpc-horizon") a.nmpc_horizon = std::stod(value());
+        else if (w == "--nmpc-fine-dt") a.nmpc_fine_dt = std::stod(value());
+        else if (w == "--nmpc-fine") a.nmpc_fine = std::stod(value());
         else throw std::invalid_argument("unknown option " + w);
     }
     if (a.controller != "both" && a.controller != "nmpc" && a.controller != "pure_pursuit")
@@ -104,6 +109,10 @@ Args parse(int argc, char** argv) {
     if (a.brake_use) a.tuning.brake_use = *a.brake_use;
     if (a.drive_use) a.tuning.drive_use = *a.drive_use;
     if (a.sideslip_deg) a.tuning.sideslip_max = *a.sideslip_deg * M_PI / 180.0;
+    if (a.nmpc_dt) a.tuning.nmpc_dt = *a.nmpc_dt;
+    if (a.nmpc_horizon) a.tuning.nmpc_horizon = *a.nmpc_horizon;
+    if (a.nmpc_fine_dt) a.tuning.nmpc_fine_dt = *a.nmpc_fine_dt;
+    if (a.nmpc_fine) a.tuning.nmpc_fine = *a.nmpc_fine;
     return a;
 }
 
@@ -124,7 +133,7 @@ void write_solves(const fs::path& file, const std::vector<NMPC::SolveStats>& sta
     fs::create_directories(file.parent_path());
     std::ofstream out(file);
     out << "t,s0,ux0,t_wall,t_total,t_proc,t_hess,t_jac,t_grad,t_f,t_g,iterations,success,status,warm,n_obstacles,obj,"
-           "slack_obstacle,slack_edge,slack_sideslip,slack_speed,x0_gap\n"
+           "slack_obstacle,slack_edge,slack_sideslip,slack_speed,x0_gap,directive\n"
         << std::setprecision(9);
     for (const auto& s : stats) {
         out << s.t << ',' << s.s0 << ',' << s.ux0 << ',' << s.t_wall << ',' << s.t_total << ',' << s.t_proc << ','
@@ -132,7 +141,7 @@ void write_solves(const fs::path& file, const std::vector<NMPC::SolveStats>& sta
             << ',' << (s.success ? "True" : "False") << ',' << s.status << ',' << (s.warm ? "True" : "False") << ','
             << s.n_obstacles << ',' << s.obj;
         for (double slack : s.slack_max) out << ',' << slack;
-        out << ',' << s.x0_gap << '\n';
+        out << ',' << s.x0_gap << ',' << (s.directive ? "True" : "False") << '\n';
     }
 }
 
@@ -161,7 +170,7 @@ json solve_breakdown(const std::vector<NMPC::SolveStats>& stats, double dt) {
     };
     auto share = [&](double part) { return total > 0.0 ? part / total : 0.0; };
     const json shares = {{"hess", share(hess)}, {"jac", share(jac)}, {"grad", share(grad)}, {"f", share(f)},
-                         {"g", share(g)},  // the rest: linear solves and IPOPT's own work
+                         {"g", share(g)},  // the rest: linear solves and the solver's own work
                          {"ipopt_internal", total > 0.0 ? 1.0 - share(hess + jac + grad + f + g) : 0.0}};
     return {{"solve_p50", percentile(50)}, {"solve_p95", percentile(95)},
             {"overrun_fraction", double(overruns) / stats.size()}, {"iter_mean", iters / stats.size()},
@@ -211,7 +220,7 @@ void run(const Args& a, const std::string& name, const Circuit& circuit, const V
             char detail[256];
             std::snprintf(detail, sizeof detail,
                           "%-13s solve p50 %.0f ms, p95 %.0f ms, over dt %.0f%%   iterations mean %.1f, max %d"
-                          "   time in hessian %.0f%%, jacobian %.0f%%, ipopt %.0f%%"
+                          "   time in hessian %.0f%%, jacobian %.0f%%, solver %.0f%%"
                           "   cpu/wall %.2f   first solve %.0f ms\n",
                           "", 1e3 * b["solve_p50"].get<double>(), 1e3 * b["solve_p95"].get<double>(),
                           100 * b["overrun_fraction"].get<double>(), b["iter_mean"].get<double>(),

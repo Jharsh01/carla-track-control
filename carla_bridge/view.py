@@ -10,6 +10,8 @@ The HUD shows the controller, the dynamics, the time, speed, lateral offset,
 sideslip and the NMPC's solve time, with a map of the track. A panel on the
 right (off with --no-rates) plots how fast the controller and the plant run in
 wall-clock time, and with the threaded bicycle plant the CARLA world thread too.
+Another (off with --no-inputs) plots the controllers' inputs: acceleration and
+steering rate, both controllers' with --controller nmpc_fallback.
 """
 import io
 import math
@@ -107,10 +109,11 @@ class Hud:
         return np.asarray(image)
 
 
-COMMAND_COLORS = {"nmpc": (90, 220, 120), "pure_pursuit": (255, 170, 60), "none": (200, 200, 200)}
+COMMAND_COLORS = {"nmpc": (90, 220, 120), "pure_pursuit": (255, 170, 60), "blend": (220, 200, 90),
+                  "none": (200, 200, 200)}
 
 
-def command_banner(status, deadline):
+def command_banner(status, period):
     """The HUD banner saying whose input the plant is getting: trackctl.FallbackControl.status()."""
     source = status["source"]
     ticks = max(1, status["ticks"])
@@ -120,7 +123,12 @@ def command_banner(status, deadline):
             1e3 * status["plan_age"], 1e3 * status["last_solve"], share), COMMAND_COLORS[source])
     if source == "pure_pursuit":
         return ("COMMAND: PURE PURSUIT (fallback)", "%s  %s" % (status["reason"], share), COMMAND_COLORS[source])
-    return ("COMMAND: waiting", "deadline %.0f ms" % (1e3 * deadline), COMMAND_COLORS["none"])
+    if source == "blend":
+        weight = status["weight"]
+        to = "to pure pursuit: " + status["reason"] if status["reason"] else "back to the NMPC"
+        return ("COMMAND: BLEND NMPC %.0f%% / PP %.0f%%" % (100.0 * (1.0 - weight), 100.0 * weight),
+                "%s  %s" % (to, share), COMMAND_COLORS[source])
+    return ("COMMAND: waiting", "NMPC period %.0f ms" % (1e3 * period), COMMAND_COLORS["none"])
 
 
 class RatePanel:
@@ -263,6 +271,132 @@ class RatePanel:
         points = [px(ti, ri) for ti, ri in zip(t[shown], rate[shown]) if math.isfinite(ri)]
         if len(points) > 1:
             d.line(points, fill=color, width=2)
+
+
+class InputPanel:
+    """A panel to the right of the camera view plotting each controller's inputs against simulated time: the
+    acceleration Fx / m and the steering rate (the model's inputs, [delta_rate, Fx]). With the NMPC and pure
+    pursuit running side by side (nmpc_fallback) both are drawn, whoever is in command, with the input the plant
+    got (`command`, a blend of the two during a handover), and a strip under each plot shows whose it was."""
+
+    WIDTH = 424  # a multiple of 8, so the video is not resized
+    WINDOW = 10.0  # seconds of simulated time shown
+    COLORS = {"nmpc": (90, 220, 120), "pure_pursuit": (255, 170, 60), "command": (235, 235, 235),
+              "blend": COMMAND_COLORS["blend"]}
+    NAMES = {"nmpc": "NMPC", "pure_pursuit": "Pure pursuit", "command": "Sent"}
+
+    def __init__(self, params, series, refresh=0.1):
+        """`series`: the controllers plotted, keys of COLORS. The plots span the vehicle's limits: brake and
+        drive force, steering rate. The panel is redrawn every `refresh` seconds of samples."""
+        self.series, self.refresh = list(series), refresh
+        self.accel_range = (-params.F_brake_max / params.m, params.F_drive_max / params.m)
+        self.rate_max = math.degrees(params.delta_rate_max)
+        self.mass = params.m
+        self.lock = threading.Lock()  # samples are added by the world thread and drawn by the view thread
+        self.cached, self.cached_t = None, -math.inf
+        self.t = []
+        self.accel = {key: [] for key in self.series}  # [m/s^2]
+        self.rate = {key: [] for key in self.series}  # [deg/s]
+        self.source = []  # whose input was commanded, or None
+        try:
+            self.font = ImageFont.truetype("DejaVuSansMono.ttf", 18)
+            self.small = ImageFont.truetype("DejaVuSansMono.ttf", 13)
+        except OSError:
+            self.font = self.small = ImageFont.load_default()
+
+    def add(self, t, inputs, source=None):
+        """A sample at simulated time t: {controller: its input [delta_rate, Fx] (NaN: none)}."""
+        with self.lock:
+            self.t.append(t)
+            for key in self.series:
+                u = inputs.get(key)
+                rate, fx = (float("nan"), float("nan")) if u is None else (u[0], u[1])
+                self.accel[key].append(fx / self.mass)
+                self.rate[key].append(math.degrees(rate))
+            self.source.append(source)
+
+    def draw(self, rgb):
+        """The camera image with the panel added on its right."""
+        with self.lock:
+            t = self.t[-1] if self.t else 0.0
+        if self.cached is None or self.cached.shape[0] != rgb.shape[0] or t - self.cached_t >= self.refresh:
+            self.cached, self.cached_t = self._render(rgb.shape[0]), t
+        return np.concatenate([rgb, self.cached], axis=1)
+
+    def _render(self, height):
+        with self.lock:  # only the window shown
+            n = len(self.t)
+            i0 = n
+            while i0 > 0 and self.t[i0 - 1] >= self.t[-1] - self.WINDOW:
+                i0 -= 1
+            t = np.asarray(self.t[i0:], float)
+            accel = {k: np.asarray(v[i0:], float) for k, v in self.accel.items()}
+            rate = {k: np.asarray(v[i0:], float) for k, v in self.rate.items()}
+            source = self.source[i0:]
+        panel = Image.new("RGB", (self.WIDTH, height), (18, 18, 22))
+        d = ImageDraw.Draw(panel)
+        d.text((16, 12), "Controller inputs", font=self.font, fill=(235, 235, 235))
+        x = 16
+        for key in self.series:  # legend
+            name = self.NAMES.get(key, key)
+            d.line([x, 50, x + 18, 50], fill=self.COLORS[key], width=3)
+            d.text((x + 24, 42), name, font=self.small, fill=(190, 190, 190))
+            x += 40 + 8 * len(name)
+        top, plot_h = 66, (height - 66) // 2
+        self._plot(d, top, plot_h, "Acceleration Fx/m", "m/s²", t, accel, self.accel_range, source)
+        self._plot(d, top + plot_h, plot_h, "Steering rate", "deg/s", t, rate, (-self.rate_max, self.rate_max),
+                   source)
+        return np.asarray(panel)
+
+    def _plot(self, d, y0, h, title, unit, t, values, y_range, source):
+        left, right = 62, self.WIDTH - 14
+        top, bottom = y0 + 26, y0 + h - 34
+        lo, hi = y_range
+        lo, hi = lo - 0.05 * (hi - lo), hi + 0.05 * (hi - lo)
+        d.text((16, y0 + 4), "%s [%s]" % (title, unit), font=self.small, fill=(190, 190, 190))
+        # the latest value of each, top right
+        x = right
+        for key in reversed(self.series):
+            v = values[key][-1] if t.size else float("nan")
+            text = "%+6.1f" % v if math.isfinite(v) else "   -  "
+            x -= 8 * len(text) + 6
+            d.text((x, y0 + 4), text, font=self.small, fill=self.COLORS[key])
+        d.rectangle([left, top, right, bottom], outline=(70, 70, 78))
+        t1 = t[-1] if t.size else 0.0
+        t0 = max(0.0, t1 - self.WINDOW)
+
+        def px(ti, vi):
+            return (left + (ti - t0) / self.WINDOW * (right - left), bottom - (vi - lo) / (hi - lo) * (bottom - top))
+
+        for v in (y_range[0], 0.0, y_range[1]):  # the limits (dashed) and zero
+            y = px(t0, v)[1]
+            d.text((4, y - 7), "%.1f" % v, font=self.small, fill=(150, 150, 158))
+            if v == 0.0:
+                d.line([left, y, right, y], fill=(90, 90, 98))
+            else:
+                for xx in range(left, right, 12):
+                    d.line([xx, y, min(xx + 6, right), y], fill=(110, 110, 118))
+        d.text((left, bottom + 18), "%.0f s" % t0, font=self.small, fill=(150, 150, 158))
+        d.text((right - 48, bottom + 18), "%.0f s" % t1, font=self.small, fill=(150, 150, 158))
+        if not t.size:
+            return
+        if any(source):  # whose input the plant got, a strip under the plot
+            for i in range(len(t) - 1):
+                if source[i] in self.COLORS:
+                    xa, xb = px(t[i], 0.0)[0], px(t[i + 1], 0.0)[0]
+                    d.rectangle([xa, bottom + 4, max(xa, xb), bottom + 12], fill=self.COLORS[source[i]])
+        for key in self.series:  # a line per stretch of finite values; what was sent thinner, on top
+            width = 1 if key == "command" else 2
+            run = []
+            for ti, vi in zip(t, values[key]):
+                if math.isfinite(vi):
+                    run.append(px(ti, min(max(vi, lo), hi)))
+                    continue
+                if len(run) > 1:
+                    d.line(run, fill=self.COLORS[key], width=width)
+                run = []
+            if len(run) > 1:
+                d.line(run, fill=self.COLORS[key], width=width)
 
 
 def _hz(rate, short=False):

@@ -39,6 +39,10 @@ std::unique_ptr<Controller> make_controller(const std::string& name, const Circu
         o.road_range = road_range;
         o.sideslip_max = tuning.sideslip_max;
         o.max_wall_time = tuning.solve_time_limit;
+        if (tuning.nmpc_dt > 0.0) o.h = tuning.nmpc_dt;
+        if (tuning.nmpc_horizon > 0.0) o.horizon = tuning.nmpc_horizon;
+        o.h_fine = tuning.nmpc_fine_dt;
+        o.fine = tuning.nmpc_fine;
         VehicleParams planned = params;
         planned.mu *= tuning.mu_use;
         planned.F_brake_max *= tuning.brake_use;

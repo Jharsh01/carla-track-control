@@ -41,10 +41,23 @@ die() { echo "error: $*" >&2; exit 1; }
 
 step "machine"
 ( . /etc/os-release 2>/dev/null && echo "   $PRETTY_NAME" ) || true
-if command -v nvidia-smi >/dev/null; then
+# the CARLA server renders with Vulkan on the NVIDIA driver; a plain cloud image (as opposed to Brev's)
+# may have the GPU attached but no driver, and CARLA then exits at start-up, so stop here rather than an hour in
+if nvidia-smi >/dev/null 2>&1; then
     nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | sed 's/^/   GPU: /'
 else
-    echo "   warning: nvidia-smi not found; the CARLA server needs an NVIDIA GPU and its driver"
+    gpu=$(lspci 2>/dev/null | grep -i nvidia | sed 's/^[^ ]* //' | head -1 || true)
+    if [[ -z $gpu ]]; then
+        problem="no NVIDIA GPU found"
+    elif command -v nvidia-smi >/dev/null; then
+        problem="$gpu, but its driver is not loaded (try: sudo modprobe nvidia, or reboot)"
+    else
+        problem="$gpu, but no NVIDIA driver is installed; install one and run this again:
+   sudo apt-get install -y nvidia-driver-580-server nvidia-utils-580-server && sudo modprobe nvidia"
+    fi
+    [[ $carla == 1 ]] || { echo "   warning (only the CARLA server needs it, and --no-carla skips that): $problem"; problem=; }
+    [[ -z $problem ]] || die "$problem
+   the CARLA server needs a working NVIDIA driver (./setup.sh --no-carla sets up the rest without it)"
 fi
 echo "   $(nproc) cores, $(free -g | awk '/Mem:/ {print $2}') GB memory, $(df -Ph . | awk 'NR==2 {print $4}') free here"
 [[ $EUID -eq 0 ]] && echo "   warning: running as root; the CARLA server refuses to start as root"
@@ -58,6 +71,11 @@ if [[ $system == 1 ]]; then
         build-essential cmake git curl ca-certificates libeigen3-dev \
         libomp5 libvulkan1 vulkan-tools xdg-user-dirs libsdl2-2.0-0 libgl1 libglib2.0-0 \
         fonts-dejavu-core
+fi
+if [[ $carla == 1 ]] && command -v vulkaninfo >/dev/null; then
+    vulkaninfo --summary 2>/dev/null | grep -q 'deviceName.*NVIDIA' \
+        || die "Vulkan finds no NVIDIA device (vulkaninfo --summary), so the CARLA server will not start;
+   reinstall the driver's Vulkan part: sudo apt-get install --reinstall libnvidia-gl-\$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | cut -d. -f1)-server"
 fi
 for tool in git curl cmake c++; do command -v $tool >/dev/null || die "$tool not found"; done
 
